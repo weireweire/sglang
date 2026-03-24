@@ -65,6 +65,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.utils.common import broadcast_pyobj
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,30 @@ class DecodePreallocQueue:
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _is_pending_resolution_leader(self) -> bool:
+        return self.scheduler.attn_tp_rank == 0 and self.scheduler.attn_cp_rank == 0
+
+    def _broadcast_pending_resolution(self, payload: Optional[dict]) -> Optional[dict]:
+        payload_list = [payload] if self._is_pending_resolution_leader() else []
+
+        if self.scheduler.attn_tp_size != 1:
+            payload_list = broadcast_pyobj(
+                payload_list,
+                self.scheduler.attn_tp_group.rank,
+                self.scheduler.attn_tp_cpu_group,
+                src=self.scheduler.attn_tp_group.ranks[0],
+            )
+
+        if self.scheduler.attn_cp_size != 1:
+            payload_list = broadcast_pyobj(
+                payload_list,
+                self.scheduler.attn_cp_group.rank,
+                self.scheduler.attn_cp_cpu_group,
+                src=self.scheduler.attn_cp_group.ranks[0],
+            )
+
+        return payload_list[0] if payload_list else None
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -500,40 +525,56 @@ class DecodePreallocQueue:
 
         bootstrap_addr = f"{self.pending_reqs[0].bootstrap_host}:{self.pending_reqs[0].bootstrap_port}"
 
-        # If a request is following the bootstrap room,
-        # we need get the prefill info before resolving the prefill_dp_ranks
-        # which is a conflict with the lazy resolve logic in CommonKVReceiver,
-        # so we need to ensure the parallel info before resolving it.
-        if not self.kv_manager.ensure_parallel_info(bootstrap_addr):
+        payload = None
+        if self._is_pending_resolution_leader():
+            # If a request is following the bootstrap room,
+            # we need get the prefill info before resolving the prefill_dp_ranks
+            # which is a conflict with the lazy resolve logic in CommonKVReceiver,
+            # so we need to ensure the parallel info before resolving it.
+            if self.kv_manager.ensure_parallel_info(bootstrap_addr):
+                resolved_by_rid = {}
+                need_query = []
+                for req in self.pending_reqs:
+                    prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                    if prefill_dp_rank is not None:
+                        resolved_by_rid[req.rid] = prefill_dp_rank
+                    else:
+                        need_query.append(req)
+
+                room_to_rank = {}
+                if need_query:
+                    from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+
+                    rooms = [req.bootstrap_room for req in need_query]
+                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                        bootstrap_addr, rooms
+                    )
+
+                payload = {
+                    "resolved_by_rid": resolved_by_rid,
+                    "room_to_rank": room_to_rank,
+                }
+
+        payload = self._broadcast_pending_resolution(payload)
+        if payload is None:
             return
 
         resolved = []
-        need_query = []
+        remaining = []
+        resolved_by_rid = payload["resolved_by_rid"]
+        room_to_rank = payload["room_to_rank"]
         for req in self.pending_reqs:
-            # NOTE: we need resolve it again because we may ensure the parallel info here
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is not None:
-                resolved.append((req, prefill_dp_rank))
+            if req.rid in resolved_by_rid:
+                resolved.append((req, int(resolved_by_rid[req.rid])))
+                continue
+
+            room_key = str(req.bootstrap_room)
+            if room_key in room_to_rank:
+                resolved.append((req, int(room_to_rank[room_key])))
             else:
-                need_query.append(req)
+                remaining.append(req)
 
-        if need_query:
-            from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-
-            rooms = [req.bootstrap_room for req in need_query]
-            room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                bootstrap_addr, rooms
-            )
-            remaining = []
-            for req in need_query:
-                room_key = str(req.bootstrap_room)
-                if room_key in room_to_rank:
-                    resolved.append((req, int(room_to_rank[room_key])))
-                else:
-                    remaining.append(req)
-            self.pending_reqs = remaining
-        else:
-            self.pending_reqs = []
+        self.pending_reqs = remaining
 
         for req, prefill_dp_rank in resolved:
             self._create_receiver_and_enqueue(req, prefill_dp_rank)
