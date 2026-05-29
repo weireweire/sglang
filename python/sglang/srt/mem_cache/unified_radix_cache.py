@@ -1410,54 +1410,84 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
 
+        host_lock_params: list[tuple[UnifiedTreeNode, DecLockRefParams]] = []
+        locked_node_ids: set[int] = set()
+
+        def lock_transfer_host_nodes(transfers: list[PoolTransfer]) -> None:
+            for transfer in transfers:
+                for transfer_node in transfer.nodes_to_load or ():
+                    if transfer_node.id in locked_node_ids:
+                        continue
+                    locked_node_ids.add(transfer_node.id)
+                    host_lock_params.append(
+                        (
+                            transfer_node,
+                            self.inc_host_lock_ref(transfer_node).to_dec_params(),
+                        )
+                    )
+
+        def release_transfer_host_nodes() -> None:
+            for transfer_node, lock_params in reversed(host_lock_params):
+                self.dec_host_lock_ref(transfer_node, lock_params)
+
+        # Host pool indices collected above must stay valid until the H->D load
+        # has been committed. Under pressure, another eviction can otherwise
+        # free the host leaf while cache_controller.load() is in progress.
+        lock_transfer_host_nodes([kv_xfer])
+        lock_transfer_host_nodes([x for xfers in comp_xfers.values() for x in xfers])
+
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
-            self.dec_lock_ref(best_match_node, ancestor_lock_params)
-            return False
-
-        if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+        try:
+            if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+                mem_quota is not None and kv_tokens > mem_quota + result.delta
+            ):
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 return False
 
-        # Load H→D
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=best_match_node.id,
-            extra_pools=aux_xfers or None,
-        )
+            if self.supports_swa():
+                avail = self.token_to_kv_pool_allocator.full_available_size()
+            else:
+                avail = self.token_to_kv_pool_allocator.available_size()
+            if avail < kv_tokens:
+                needed = kv_tokens - avail
+                result = self.evict(EvictParams(num_tokens=needed))
+                if result.num_tokens_evicted < needed:
+                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                    return False
 
-        self.dec_lock_ref(best_match_node, ancestor_lock_params)
-        if device_indices is None:
-            return False
+            # Load H→D
+            aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+            aux_xfers.extend(sidecar_xfers)
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=best_match_node.id,
+                extra_pools=aux_xfers or None,
+            )
 
-        # Commit: each component gets only its own transfers
-        kv_xfer.device_indices = device_indices
-        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
-            best_match_node,
-            CacheTransferPhase.LOAD_BACK,
-            [kv_xfer],
-        )
-        for node in kv_xfer.nodes_to_load or ():
-            self._record_store_event(node, medium=StorageMedium.GPU)
-        for ct, xfers in comp_xfers.items():
-            self.components[ct].commit_hicache_transfer(
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            if device_indices is None:
+                return False
+
+            # Commit: each component gets only its own transfers
+            kv_xfer.device_indices = device_indices
+            self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
                 best_match_node,
                 CacheTransferPhase.LOAD_BACK,
-                xfers,
+                [kv_xfer],
             )
+            for node in kv_xfer.nodes_to_load or ():
+                self._record_store_event(node, medium=StorageMedium.GPU)
+            for ct, xfers in comp_xfers.items():
+                self.components[ct].commit_hicache_transfer(
+                    best_match_node,
+                    CacheTransferPhase.LOAD_BACK,
+                    xfers,
+                )
+
+        finally:
+            release_transfer_host_nodes()
 
         self._update_evictable_leaf_sets(best_match_node)
         self.ongoing_load_back[best_match_node.id] = (

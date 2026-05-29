@@ -356,6 +356,21 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+
+        if lock_host:
+            if node is self.cache.root_node:
+                return result
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
+                return result
+            if cd.host_lock_ref == 0:
+                host_lru = self.cache.host_lru_lists[ct]
+                if host_lru.in_list(node):
+                    host_lru.remove_node(node)
+            cd.host_lock_ref += 1
+            return result
+
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
@@ -393,9 +408,23 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
+
+        if lock_host:
+            if node is self.cache.root_node or node.id in skip_lock_node_ids:
+                return
+            cd = node.component_data[ct]
+            if cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            if cd.host_lock_ref == 0 and cd.value is None and cd.host_value is not None:
+                host_lru = self.cache.host_lru_lists[ct]
+                if not host_lru.in_list(node):
+                    host_lru.insert_mru(node)
+            return
+
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
-        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
 
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
