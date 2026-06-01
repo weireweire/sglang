@@ -1430,16 +1430,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for transfer_node, lock_params in reversed(host_lock_params):
                 self.dec_host_lock_ref(transfer_node, lock_params)
 
-        # Host pool indices collected above must stay valid until the H->D load
-        # has been committed. Under pressure, another eviction can otherwise
-        # free the host leaf while cache_controller.load() is in progress.
-        lock_transfer_host_nodes([kv_xfer])
-        lock_transfer_host_nodes([x for xfers in comp_xfers.values() for x in xfers])
-
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
         try:
+            # Host pool indices collected above must stay valid until the H->D
+            # load has been committed. Under pressure, another eviction can
+            # otherwise free the host leaf while cache_controller.load() is in
+            # progress. Lock inside the try so a partial-lock failure is still
+            # released by the finally below.
+            lock_transfer_host_nodes([kv_xfer])
+            lock_transfer_host_nodes(
+                [x for xfers in comp_xfers.values() for x in xfers]
+            )
+
             if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
                 mem_quota is not None and kv_tokens > mem_quota + result.delta
             ):
