@@ -73,6 +73,14 @@ class FullComponent(TreeComponent):
                 kv_host_hit += len(full_host)
             node = node.parent
         if kv_host_hit > 0:
+            self.cache._log_cache_diag(
+                "full_host_match",
+                sample=True,
+                kv_host_hit=kv_host_hit,
+                **self.cache._req_diag(params.req),
+                **self.cache._node_diag("best", result.best_match_node),
+                **self.cache._node_diag("last_device", result.last_device_node),
+            )
             return result._replace(
                 host_hit_length=max(result.host_hit_length, kv_host_hit)
             )
@@ -138,6 +146,12 @@ class FullComponent(TreeComponent):
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+        self.cache._log_cache_diag(
+            "full_drive_eviction",
+            include_pool=True,
+            request_tokens=request,
+            freed_full=tracker[ct],
+        )
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
@@ -153,6 +167,12 @@ class FullComponent(TreeComponent):
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
+        self.cache._log_cache_diag(
+            "full_drive_host_eviction",
+            include_pool=True,
+            request_tokens=num_tokens,
+            freed_full=tracker[ct],
+        )
 
     def acquire_component_lock(
         self,
@@ -305,3 +325,9 @@ class FullComponent(TreeComponent):
                 self.cache._update_evictable_leaf_sets(n)
 
             self.cache._update_evictable_leaf_sets(node)
+            self.cache._log_cache_diag(
+                "full_load_back_commit",
+                restored_tokens=offset,
+                node_ids=[n.id for n in xfer.nodes_to_load or ()],
+                **self.cache._node_diag("best", node),
+            )
