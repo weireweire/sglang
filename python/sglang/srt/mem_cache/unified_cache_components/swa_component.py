@@ -210,20 +210,31 @@ class SWAComponent(TreeComponent):
         params: InsertParams,
     ) -> None:
         # _unevict_node_on_insert already wrote the request's fresh KV slice
-        # into the base value. We just need to rebuild SWA from that slice for
-        # the in-window portion. There is no old SWA slot to free here.
+        # into the base value. We either remap retained SWA slots to that
+        # fresh Full value, or rebuild SWA from the slice for the in-window
+        # portion.
         ct = self.component_type
-        if node.component_data[ct].value is not None:
+        cd = node.component_data[ct]
+        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if cd.value is not None:
+            # The node retained SWA device slots while FULL was demoted to
+            # host. `_unevict_node_on_insert` has just installed fresh FULL
+            # slots, whose allocator-side SWA pair is unused here. Keep the
+            # retained SWA slots and remap the fresh FULL slots to them.
+            assert len(full_value) == len(cd.value)
+            self.cache.token_to_kv_pool_allocator.free_swa(full_value)
+            self.cache.token_to_kv_pool_allocator.set_full_to_swa_mapping(
+                full_value, cd.value
+            )
             return
         assert (
-            node.component_data[ct].lock_ref == 0
+            cd.lock_ref == 0
         ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
             swa_evicted_seqlen % self.cache.page_size == 0
         ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
-        full_value = node.component_data[BASE_COMPONENT_TYPE].value
         if swa_evicted_seqlen <= total_prefix_len:
             swa_value = self._translate_full_to_swa(full_value)
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
@@ -347,12 +358,14 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
-            self.cache.token_to_kv_pool_allocator.free_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if full_value is not None:
+                # Pass full indices to free_swa so slots with no SWA pair are
+                # skipped. Freeing swa_value directly would double free those
+                # entries since they all map to the same sentinel slot.
+                self.cache.token_to_kv_pool_allocator.free_swa(full_value)
+            else:
+                self.cache.token_to_kv_pool_allocator.free_swa_indices(cd.value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[ct] -= freed
             cd.value = None
@@ -393,7 +406,9 @@ class SWAComponent(TreeComponent):
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
+                self.cache._evict_device_leaf(
+                    x, tracker, trigger_component=self.component_type
+                )
                 if not lru.in_list(x_next):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
@@ -638,7 +653,10 @@ class SWAComponent(TreeComponent):
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            assert transfers and transfers[0].device_indices is not None
+            if not transfers:
+                self._rebuild_device_mappings_for_path(node)
+                return
+            assert transfers[0].device_indices is not None
             xfer = transfers[0]
             device_indices = xfer.device_indices
             allocator = self.cache.token_to_kv_pool_allocator
@@ -655,6 +673,7 @@ class SWAComponent(TreeComponent):
                 allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
+            self._rebuild_device_mappings_for_path(node)
             return
 
         if phase == CacheTransferPhase.PREFETCH:
@@ -748,6 +767,26 @@ class SWAComponent(TreeComponent):
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
             self._release_swa_host(host_indices[: pos - loaded_start])
+
+    def _rebuild_device_mappings_for_path(self, node: UnifiedTreeNode) -> None:
+        allocator = self.cache.token_to_kv_pool_allocator
+        if not hasattr(allocator, "set_full_to_swa_mapping"):
+            return
+
+        ct = self.component_type
+        n_swa = 0
+        cur = node
+        while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
+            cd = cur.component_data[ct]
+            full_cd = cur.component_data[BASE_COMPONENT_TYPE]
+            if cd.value is not None:
+                if full_cd.value is not None:
+                    assert len(full_cd.value) == len(cd.value)
+                    allocator.set_full_to_swa_mapping(full_cd.value, cd.value)
+                n_swa += len(cd.value)
+            elif cd.host_value is not None:
+                n_swa += len(cd.host_value)
+            cur = cur.parent
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

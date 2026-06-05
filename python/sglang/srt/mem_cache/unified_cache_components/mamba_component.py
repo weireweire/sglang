@@ -210,7 +210,9 @@ class MambaComponent(TreeComponent):
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
+                self.cache._evict_device_leaf(
+                    x, tracker, trigger_component=self.component_type
+                )
                 if not lru.in_list(x_next):
                     x_next = lru.get_lru_no_lock()
                 x = x_next

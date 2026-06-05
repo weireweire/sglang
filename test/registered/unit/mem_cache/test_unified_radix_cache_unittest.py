@@ -2244,6 +2244,226 @@ class UnifiedRadixCacheSuite:
         self.assertIn(node, tree.evictable_host_leaves)
         tree.sanity_check()
 
+    def test_hicache_full_demote_retains_swa_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_full = node.component_data[ComponentType.FULL].value.clone()
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+
+        self._backup_node(tree, node)
+        result = tree.evict(EvictParams(num_tokens=len(node.key)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(node.key))
+
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertIsNone(node.component_data[ComponentType.FULL].value)
+        self.assertEqual(
+            node.component_data[ComponentType.SWA].value.tolist(), old_swa.tolist()
+        )
+        self.assertTrue(tree.lru_lists[ComponentType.SWA].in_list(node))
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        self.assertEqual(
+            allocator.full_to_swa_index_mapping[old_full].tolist(),
+            [0] * len(old_full),
+        )
+        tree.sanity_check()
+
+        self._load_back_node(tree, node)
+        new_full = node.component_data[ComponentType.FULL].value
+        self.assertIsNotNone(new_full)
+        self.assertEqual(
+            node.component_data[ComponentType.SWA].value.tolist(), old_swa.tolist()
+        )
+        self.assertEqual(
+            allocator.translate_loc_from_full_to_swa(new_full).tolist(),
+            old_swa.tolist(),
+        )
+        self._release_ongoing_load_back_locks(tree)
+        tree.sanity_check()
+
+    def test_hicache_full_write_back_skips_swa_backup_and_retains_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("keeps the trigger-specific SWA assertion focused")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        seq = self._make_seq(1, max(2, self.cfg.page_size))
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+        self.assertFalse(node.backuped)
+
+        result = tree.evict(EvictParams(num_tokens=len(node.key)))
+        self.assertGreaterEqual(result.num_tokens_evicted, len(node.key))
+        self.assertEqual(result.swa_num_tokens_evicted, 0)
+
+        full_cd = node.component_data[ComponentType.FULL]
+        swa_cd = node.component_data[ComponentType.SWA]
+        self.assertIsNone(full_cd.value)
+        self.assertIsNotNone(full_cd.host_value)
+        self.assertEqual(swa_cd.value.tolist(), old_swa.tolist())
+        self.assertIsNone(swa_cd.host_value)
+        self.assertTrue(tree.lru_lists[ComponentType.SWA].in_list(node))
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_swa_write_back_frees_swa_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("keeps the trigger-specific SWA assertion focused")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        seq = self._make_seq(1, max(2, self.cfg.page_size))
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+        self.assertFalse(node.backuped)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=len(old_swa)))
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(old_swa))
+
+        full_cd = node.component_data[ComponentType.FULL]
+        swa_cd = node.component_data[ComponentType.SWA]
+        self.assertIsNone(full_cd.value)
+        self.assertIsNotNone(full_cd.host_value)
+        self.assertIsNone(swa_cd.value)
+        self.assertIsNotNone(swa_cd.host_value)
+        self.assertEqual(len(swa_cd.host_value), len(old_swa))
+        self.assertFalse(tree.lru_lists[ComponentType.SWA].in_list(node))
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_mixed_full_swa_write_back_frees_backed_swa_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("keeps the trigger-specific SWA assertion focused")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(tree, write_policy="write_back")
+        seq = self._make_seq(1, max(2, self.cfg.page_size))
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+        self.assertFalse(node.backuped)
+
+        result = tree.evict(
+            EvictParams(num_tokens=len(node.key), swa_num_tokens=len(old_swa))
+        )
+        self.assertGreaterEqual(result.num_tokens_evicted, len(node.key))
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(old_swa))
+
+        full_cd = node.component_data[ComponentType.FULL]
+        swa_cd = node.component_data[ComponentType.SWA]
+        self.assertIsNone(full_cd.value)
+        self.assertIsNotNone(full_cd.host_value)
+        self.assertIsNone(swa_cd.value)
+        self.assertIsNotNone(swa_cd.host_value)
+        self.assertEqual(len(swa_cd.host_value), len(old_swa))
+        self.assertFalse(tree.lru_lists[ComponentType.SWA].in_list(node))
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_insert_unevict_remaps_retained_swa_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+
+        self._backup_node(tree, node)
+        tree.evict(EvictParams(num_tokens=len(node.key)))
+
+        self.assertTrue(node.evicted)
+        self.assertEqual(
+            node.component_data[ComponentType.SWA].value.tolist(), old_swa.tolist()
+        )
+        swa_avail_before_insert = allocator.swa_attn_allocator.available_size()
+
+        key = RadixKey(array("q", seq))
+        value = self._alloc(allocator, len(seq))
+        tree.insert(InsertParams(key=key, value=value[: len(key)]))
+
+        self.assertFalse(node.evicted)
+        self.assertEqual(
+            node.component_data[ComponentType.SWA].value.tolist(), old_swa.tolist()
+        )
+        self.assertEqual(
+            allocator.translate_loc_from_full_to_swa(
+                node.component_data[ComponentType.FULL].value
+            ).tolist(),
+            old_swa.tolist(),
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(), swa_avail_before_insert
+        )
+        tree.sanity_check()
+
+    def test_hicache_host_leaf_eviction_frees_retained_swa_device(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self._skip_unsupported_hicache_test():
+            return
+
+        tree, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        node = m.last_device_node
+        old_swa = node.component_data[ComponentType.SWA].value.clone()
+        self._backup_node(tree, node)
+        tree.evict(EvictParams(num_tokens=len(node.key)))
+
+        self.assertIsNone(node.component_data[ComponentType.FULL].value)
+        self.assertEqual(
+            node.component_data[ComponentType.SWA].value.tolist(), old_swa.tolist()
+        )
+        swa_avail_before_host_evict = allocator.swa_attn_allocator.available_size()
+
+        tree.evict_host(len(node.key))
+
+        self.assertNotIn(node, tree.evictable_host_leaves)
+        self.assertNotIn(node, node.parent.children.values())
+        self.assertFalse(tree.lru_lists[ComponentType.SWA].in_list(node))
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(),
+            swa_avail_before_host_evict + len(old_swa),
+        )
+        tree.sanity_check()
+
     def test_hicache_match_through_evicted_node(self):
         """Match can traverse evicted (S3) nodes using host_value."""
         if self._skip_unsupported_hicache_test():
@@ -2559,7 +2779,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_hicache_evict_to_host_updates_aux_lru(self):
-        """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
+        """D->H eviction moves tombstoned aux to host LRU and retained SWA stays on device."""
         aux_types = [
             ct
             for ct in (ComponentType.MAMBA, ComponentType.SWA)
@@ -2583,8 +2803,15 @@ class UnifiedRadixCacheSuite:
         tree.evict(EvictParams(num_tokens=len(seq)))
 
         for aux in aux_types:
-            self.assertFalse(tree.lru_lists[aux].in_list(node))
-            if node.component_data[aux].host_value is not None:
+            if aux == ComponentType.SWA and node.component_data[aux].value is not None:
+                self.assertTrue(tree.lru_lists[aux].in_list(node))
+                self.assertFalse(tree.host_lru_lists[aux].in_list(node))
+            else:
+                self.assertFalse(tree.lru_lists[aux].in_list(node))
+            if (
+                node.component_data[aux].host_value is not None
+                and node.component_data[aux].value is None
+            ):
                 self.assertTrue(tree.host_lru_lists[aux].in_list(node))
         tree.sanity_check()
 
@@ -2917,6 +3144,15 @@ class UnifiedRadixCacheSuite:
         self.assertIsNotNone(cd_full.host_value)
         self.assertIsNotNone(cd_swa.host_value)
         self.assertIn(node, tree.evictable_host_leaves)
+        self.assertIsNotNone(cd_swa.value)
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_component_and_detach_lru(
+            node,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+            tracker=tracker,
+        )
+        self.assertIsNone(cd_swa.value)
         self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(node))
 
         # Drop FULL host bookkeeping. SWA side must stay intact.

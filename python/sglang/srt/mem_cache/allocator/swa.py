@@ -333,13 +333,29 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
+            self.full_to_swa_index_mapping[full_indices] = swa_indices.to(
+                dtype=self.full_to_swa_index_mapping.dtype
+            )
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        if full_indices.numel() == 0:
+            return
+        if _is_npu:
+            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = 0
+        else:
+            self.full_to_swa_index_mapping[full_indices] = 0
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        self.free_swa_indices(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0
+
+    def free_swa_indices(self, swa_indices: torch.Tensor):
+        swa_indices = swa_indices[swa_indices > 0]
+        if swa_indices.numel() == 0:
+            return
+        self.swa_attn_allocator.free(swa_indices)
 
     def backup_state(self):
         return [

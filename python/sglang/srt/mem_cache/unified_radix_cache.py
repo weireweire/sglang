@@ -1149,9 +1149,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         trigger: TreeComponent,
         tracker: dict[ComponentType, int],
         target: EvictLayer = EvictLayer.DEVICE,
+        skip_components: Optional[set[ComponentType]] = None,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
+        skip_components = skip_components or set()
         is_leaf = False
         if target == EvictLayer.DEVICE:
             is_leaf = node in self.evictable_device_leaves
@@ -1161,6 +1163,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
+            if comp.component_type in skip_components:
+                continue
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
@@ -1239,16 +1243,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(cur)
                 break
 
-            # Full device absent — clean up orphaned aux device data.
+            if has_host:
+                self._update_evictable_leaf_sets(cur)
+                break
+
+            # Full absent on both layers — evict remaining device data.
             for comp in self.components.values():
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
                         cur, comp, target=EvictLayer.DEVICE, tracker=tracker
                     )
-
-            if has_host:
-                self._update_evictable_leaf_sets(cur)
-                break
 
             # Full absent on both layers — evict remaining host data, delete.
             for comp in self.components.values():
@@ -1277,7 +1281,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if ct == BASE_COMPONENT_TYPE:
                 continue  # Full uses leaf sets, not LRU
             cd = node.component_data[ct]
-            if (cd.host_value if target is EvictLayer.HOST else cd.value) is not None:
+            if target is EvictLayer.HOST:
+                has_lru_value = cd.host_value is not None and cd.value is None
+            else:
+                has_lru_value = cd.value is not None
+            if has_lru_value:
                 lru = lru_dict[ct]
                 if skip_existing and lru.in_list(node):
                     continue
@@ -1320,6 +1328,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         if not node.backuped:
             return False
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            return False
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return False
         if len(node.children) > 0:
@@ -1339,15 +1349,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.evictable_host_leaves.discard(node)
 
     def _evict_to_host(
-        self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
+        self,
+        node: UnifiedTreeNode,
+        tracker: Optional[dict[ComponentType, int]] = None,
+        retain_device_swa: bool = False,
     ) -> None:
-        """GPU→CPU demotion: release all device resources, node stays in tree."""
+        """GPU→CPU demotion; optionally keep SWA device data for FULL eviction."""
         assert not node.evicted and node.backuped
         trigger = self.components[BASE_COMPONENT_TYPE]
+        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        retain_device_swa = retain_device_swa and (
+            ComponentType.SWA in self.components
+            and node.component_data[ComponentType.SWA].value is not None
+        )
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
-        self._cascade_evict(node, trigger, tracker)
+        if retain_device_swa and hasattr(
+            self.token_to_kv_pool_allocator, "clear_full_to_swa_mapping"
+        ):
+            self.token_to_kv_pool_allocator.clear_full_to_swa_mapping(full_value)
+        self._cascade_evict(
+            node,
+            trigger,
+            tracker,
+            skip_components={ComponentType.SWA} if retain_device_swa else None,
+        )
         self._record_remove_event(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
@@ -1357,7 +1384,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node.parent)
 
     def _evict_device_leaf(
-        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        trigger_component: ComponentType = BASE_COMPONENT_TYPE,
+        retain_device_swa: Optional[bool] = None,
     ) -> None:
         """Evict a device leaf node, choosing the right strategy:
 
@@ -1368,14 +1399,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         All freed device tokens are accumulated into *tracker*.
         """
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if retain_device_swa is None:
+            retain_device_swa = trigger_component == BASE_COMPONENT_TYPE
         if not node.backuped:
             if (
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
-                self.write_backup(node, write_back=True)
+                skip_backup_components = (
+                    {ComponentType.SWA} if retain_device_swa else None
+                )
+                self.write_backup(
+                    node,
+                    write_back=True,
+                    skip_components=skip_backup_components,
+                )
                 self.writing_check(write_back=True)
-                self._evict_to_host(node, tracker)
+                self._evict_to_host(
+                    node, tracker, retain_device_swa=retain_device_swa
+                )
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
@@ -1390,7 +1432,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
-        self._evict_to_host(node, tracker)
+        self._evict_to_host(node, tracker, retain_device_swa=retain_device_swa)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1412,10 +1454,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
-    def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
+    def write_backup(
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        skip_components: Optional[set[ComponentType]] = None,
+    ) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
             return 0
+        skip_components = skip_components or set()
 
         # Backup invariant (write-through): parent must be backuped first
         if not write_back and (
@@ -1431,6 +1479,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if comp.component_type in skip_components:
                 continue
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
@@ -1606,11 +1656,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         for node in kv_xfer.nodes_to_load or ():
             self._record_store_event(node, medium=StorageMedium.GPU)
-        for ct, xfers in comp_xfers.items():
-            self.components[ct].commit_hicache_transfer(
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            comp.commit_hicache_transfer(
                 best_match_node,
                 CacheTransferPhase.LOAD_BACK,
-                xfers,
+                comp_xfers.get(comp.component_type, ()),
             )
 
         self._update_evictable_leaf_sets(best_match_node)
@@ -2536,7 +2588,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if ct == FCT:
                     continue
                 cd = node.component_data[ct]
-                if cd.value is not None and not full_dev:
+                aux_device_supported = full_dev or (
+                    ct == ComponentType.SWA and full_hst
+                )
+                if cd.value is not None and not aux_device_supported:
                     E(f"node {nid} {ct} device present but Full.value=None")
                 if cd.host_value is not None and not full_hst:
                     E(f"node {nid} {ct} host present but Full.host_value=None")
@@ -2562,7 +2617,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     E(f"node {nid} {ct} lock_ref={cd.lock_ref}")
                 if cd.host_lock_ref < 0:
                     E(f"node {nid} {ct} host_lock_ref={cd.host_lock_ref}")
-                if ct != FCT and fl < cd.lock_ref:
+                aux_lock_without_full_device = (
+                    ct == ComponentType.SWA and not full_dev and full_hst
+                )
+                if ct != FCT and fl < cd.lock_ref and not aux_lock_without_full_device:
                     E(f"node {nid} full_lock={fl} < {ct}_lock={cd.lock_ref}")
                 if cd.value is None and cd.lock_ref > 0:
                     E(f"node {nid} {ct} evicted but lock_ref={cd.lock_ref}")
@@ -2782,6 +2840,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     if ct == BASE_COMPONENT_TYPE:
                         continue  # Full uses evictable_host_leaves, not host LRU
                     cd = node.component_data[ct]
-                    if cd.host_value is not None:
+                    if cd.host_value is not None and cd.value is None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
