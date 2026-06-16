@@ -321,6 +321,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def log_cache_capacity_snapshot(self) -> None:
+        """Emit cache capacity diagnostics, if implemented by the cache."""
+        pass
+
     def take_events(self):
         return []
 

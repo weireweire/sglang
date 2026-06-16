@@ -274,6 +274,73 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+_CACHE_DIAG_CAPACITY_INTERVAL_SEC = 10.0
+_CACHE_DIAG_DETAIL_SAMPLE_RATE = 64
+_CACHE_DIAG_LARGE_EVENT_TOKENS = 8192
+_CACHE_DIAG_ALWAYS_EVENTS = {
+    "init_hicache",
+}
+_CACHE_DIAG_NOISY_EVENTS = {
+    "component_evict",
+    "evict",
+    "evict_device_leaf",
+    "evict_host",
+    "evict_host_leaf",
+    "evict_host_start",
+    "evict_start",
+    "evict_to_host",
+    "full_drive_eviction",
+    "full_drive_host_eviction",
+    "full_load_back_commit",
+    "init_load_back_empty",
+    "init_load_back_start",
+    "init_load_back_success",
+    "load_ack",
+    "load_back_skip",
+    "load_back_start",
+    "load_back_success",
+    "swa_drive_eviction",
+    "swa_drive_host_eviction",
+    "swa_load_back_commit",
+    "swa_load_back_transfer",
+    "write_ack",
+    "write_backup_start",
+    "write_backup_success",
+}
+_CACHE_DIAG_COUNTER_EVENTS = {
+    "evict_request_full",
+    "evict_request_full_swa",
+    "evict_request_full_tokens",
+    "evict_request_swa",
+    "evict_request_swa_tokens",
+    "evict_full_tokens_by_full",
+    "evict_full_tokens_by_swa",
+    "evict_swa_tokens_by_full",
+    "evict_swa_tokens_by_swa",
+}
+_CACHE_DIAG_LARGE_TOKEN_FIELDS = {
+    "backed_up_tokens",
+    "device_freed",
+    "device_tokens",
+    "evicted",
+    "freed_full",
+    "freed_mamba",
+    "freed_swa",
+    "host_freed",
+    "host_hit_length",
+    "host_tokens",
+    "kv_host_hit",
+    "kv_tokens",
+    "loaded_tokens",
+    "n_swa",
+    "request_full",
+    "request_mamba",
+    "request_swa",
+    "request_tokens",
+    "req_host_hit_length",
+    "restored_tokens",
+}
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -344,6 +411,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.components.values()
         )
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
+        self._cache_diag_counters: defaultdict[str, int] = defaultdict(int)
+        self._cache_diag_last_log_time: dict[str, float] = {}
+        self._cache_diag_counter_last: dict[str, int] = {}
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -488,6 +558,411 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self._record_all_cleared_event()
 
+    # ---- Diagnostic logging ----
+
+    def _cache_diag_enabled(self) -> bool:
+        return envs.SGLANG_HICACHE_DEBUG_LOG.get()
+
+    def _cache_diag_is_failure_event(self, event: str) -> bool:
+        return "fail" in event or "error" in event
+
+    def _cache_diag_is_large_event(self, fields: dict[str, Any]) -> bool:
+        for key in _CACHE_DIAG_LARGE_TOKEN_FIELDS:
+            value = fields.get(key)
+            if isinstance(value, bool):
+                continue
+            if (
+                isinstance(value, (int, float))
+                and value >= _CACHE_DIAG_LARGE_EVENT_TOKENS
+            ):
+                return True
+        return False
+
+    def _cache_diag_should_log(
+        self,
+        event: str,
+        count: int,
+        sample: bool,
+        fields: dict[str, Any],
+    ) -> bool:
+        if event == "capacity_snapshot":
+            now = time.monotonic()
+            last = self._cache_diag_last_log_time.get(event)
+            if last is not None and now - last < _CACHE_DIAG_CAPACITY_INTERVAL_SEC:
+                return False
+            self._cache_diag_last_log_time[event] = now
+            return True
+
+        if event in _CACHE_DIAG_ALWAYS_EVENTS or self._cache_diag_is_failure_event(
+            event
+        ):
+            return True
+
+        if sample:
+            sample_rate = max(1, envs.SGLANG_HICACHE_DEBUG_SAMPLE_RATE.get())
+            return count == 1 or count % sample_rate == 0
+
+        if event in _CACHE_DIAG_NOISY_EVENTS:
+            if self._cache_diag_is_large_event(fields):
+                return True
+            sample_rate = max(
+                1,
+                min(
+                    envs.SGLANG_HICACHE_DEBUG_SAMPLE_RATE.get(),
+                    _CACHE_DIAG_DETAIL_SAMPLE_RATE,
+                ),
+            )
+            return count == 1 or count % sample_rate == 0
+
+        return True
+
+    def _fmt_diag_value(self, value: Any) -> str:
+        if value is None:
+            return "none"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, (list, tuple, set)):
+            return ",".join(self._fmt_diag_value(v) for v in value) or "none"
+        if isinstance(value, dict):
+            return ",".join(
+                f"{self._fmt_diag_value(k)}:{self._fmt_diag_value(v)}"
+                for k, v in value.items()
+            ) or "none"
+        if hasattr(value, "name") and getattr(value, "name", None) is not None:
+            text = str(value)
+            if text.isdigit():
+                text = value.name.lower()
+            return text.replace(" ", "_")
+        return str(value).replace(" ", "_")
+
+    def _safe_len(self, value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            return len(value)
+        except TypeError:
+            return 0
+
+    def _safe_call_int(self, obj: Any, method_name: str) -> Optional[int]:
+        method = getattr(obj, method_name, None)
+        if method is None:
+            return None
+        try:
+            return int(method())
+        except Exception:
+            return None
+
+    def _req_diag(self, req: Optional[Req]) -> dict[str, Any]:
+        if req is None:
+            return {}
+        return {
+            "rid": getattr(req, "rid", None),
+            "req_pool_idx": getattr(req, "req_pool_idx", None),
+            "req_fill_len": self._safe_len(getattr(req, "fill_ids", None)),
+            "req_prefix_len": self._safe_len(getattr(req, "prefix_indices", None)),
+            "req_cache_protected_len": getattr(req, "cache_protected_len", None),
+            "req_swa_evicted_seqlen": getattr(req, "swa_evicted_seqlen", None),
+            "req_host_hit_length": getattr(req, "host_hit_length", None),
+        }
+
+    def _node_diag(
+        self, prefix: str, node: Optional[UnifiedTreeNode]
+    ) -> dict[str, Any]:
+        if node is None:
+            return {f"{prefix}_id": None}
+
+        prefix_len = 0
+        depth = 0
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            prefix_len += self._safe_len(cur.key)
+            depth += 1
+            cur = cur.parent
+        fields: dict[str, Any] = {
+            f"{prefix}_id": node.id,
+            f"{prefix}_key_len": self._safe_len(node.key),
+            f"{prefix}_prefix_len": prefix_len,
+            f"{prefix}_depth": depth,
+            f"{prefix}_children": len(node.children),
+            f"{prefix}_evicted": node.evicted,
+            f"{prefix}_backuped": node.backuped,
+            f"{prefix}_last_access": node.last_access_time,
+        }
+        for ct in self.tree_components:
+            name = str(ct)
+            cd = node.component_data[ct]
+            fields[f"{prefix}_{name}_dev"] = self._safe_len(cd.value)
+            fields[f"{prefix}_{name}_host"] = self._safe_len(cd.host_value)
+            fields[f"{prefix}_{name}_lock"] = cd.lock_ref
+            fields[f"{prefix}_{name}_host_lock"] = cd.host_lock_ref
+        return fields
+
+    def _tracker_diag(
+        self, tracker: Optional[dict[ComponentType, int]]
+    ) -> dict[str, Any]:
+        if not tracker:
+            return {}
+        return {f"freed_{str(ct)}": count for ct, count in tracker.items()}
+
+    def _transfer_diag(self, transfers: Optional[list[PoolTransfer]]) -> str:
+        parts = []
+        for transfer in transfers or ():
+            node_ids = [n.id for n in transfer.nodes_to_load or ()]
+            parts.append(
+                ":".join(
+                    [
+                        str(transfer.name),
+                        f"h{self._safe_len(transfer.host_indices)}",
+                        f"d{self._safe_len(transfer.device_indices)}",
+                        f"nodes={','.join(map(str, node_ids)) or 'none'}",
+                    ]
+                )
+            )
+        return "|".join(parts) or "none"
+
+    def _add_capacity_diag(
+        self,
+        fields: dict[str, Any],
+        prefix: str,
+        capacity: Optional[int],
+        free: Optional[int],
+    ) -> None:
+        fields[f"{prefix}_capacity"] = capacity
+        fields[f"{prefix}_free"] = free
+        if capacity is not None and free is not None:
+            fields[f"{prefix}_used"] = max(0, capacity - free)
+
+    def _add_capacity_usage_diag(
+        self,
+        fields: dict[str, Any],
+        prefix: str,
+        capacity: Optional[int],
+        free: Optional[int],
+    ) -> None:
+        fields[f"{prefix}_capacity"] = capacity
+        if capacity is not None and free is not None and capacity > 0:
+            used_pct = 100.0 * max(0, capacity - free) / capacity
+            fields[f"{prefix}_used_pct"] = f"{used_pct:.2f}"
+
+    def _capacity_diag(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is not None:
+            self._add_capacity_usage_diag(
+                fields,
+                "device_full",
+                getattr(allocator, "size_full", None),
+                self._safe_call_int(allocator, "full_available_size"),
+            )
+            self._add_capacity_usage_diag(
+                fields,
+                "device_swa",
+                getattr(allocator, "size_swa", None),
+                self._safe_call_int(allocator, "swa_available_size"),
+            )
+
+        if self.cache_controller is not None:
+            host_pool = getattr(self.cache_controller, "mem_pool_host", None)
+            for entry in getattr(host_pool, "entries", None) or ():
+                pool_name = str(entry.name)
+                if pool_name in ("full", "kv"):
+                    prefix = "host_full"
+                elif pool_name == "swa":
+                    prefix = "host_swa"
+                else:
+                    continue
+                pool = entry.host_pool
+                self._add_capacity_usage_diag(
+                    fields,
+                    prefix,
+                    getattr(pool, "size", None),
+                    self._safe_call_int(pool, "available_size"),
+                )
+        return fields
+
+    def _tree_residency_diag(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {"tree_nodes": 0}
+        for ct in self.tree_components:
+            name = str(ct)
+            fields[f"tree_{name}_dev_tokens"] = 0
+            fields[f"tree_{name}_host_tokens"] = 0
+            fields[f"tree_{name}_dev_nodes"] = 0
+            fields[f"tree_{name}_host_nodes"] = 0
+            fields[f"tree_{name}_host_only_tokens"] = 0
+            fields[f"tree_{name}_host_only_nodes"] = 0
+            fields[f"tree_{name}_duplicated_tokens"] = 0
+
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            fields["tree_nodes"] += 1
+            stack.extend(node.children.values())
+            if node is self.root_node:
+                continue
+            for ct in self.tree_components:
+                name = str(ct)
+                cd = node.component_data[ct]
+                dev_tokens = self._safe_len(cd.value)
+                host_tokens = self._safe_len(cd.host_value)
+                if dev_tokens:
+                    fields[f"tree_{name}_dev_tokens"] += dev_tokens
+                    fields[f"tree_{name}_dev_nodes"] += 1
+                if host_tokens:
+                    fields[f"tree_{name}_host_tokens"] += host_tokens
+                    fields[f"tree_{name}_host_nodes"] += 1
+                if host_tokens and not dev_tokens:
+                    fields[f"tree_{name}_host_only_tokens"] += host_tokens
+                    fields[f"tree_{name}_host_only_nodes"] += 1
+                if host_tokens and dev_tokens:
+                    fields[f"tree_{name}_duplicated_tokens"] += min(
+                        host_tokens, dev_tokens
+                    )
+        return fields
+
+    def _pool_diag(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "device_leaf_count": len(self.evictable_device_leaves),
+            "host_leaf_count": len(self.evictable_host_leaves),
+        }
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is not None:
+            dev_free = self._safe_call_int(allocator, "available_size")
+            full_free = self._safe_call_int(allocator, "full_available_size")
+            swa_free = self._safe_call_int(allocator, "swa_available_size")
+            self._add_capacity_diag(
+                fields, "dev", getattr(allocator, "size", None), dev_free
+            )
+            self._add_capacity_diag(
+                fields, "dev_full", getattr(allocator, "size_full", None), full_free
+            )
+            self._add_capacity_diag(
+                fields, "dev_swa", getattr(allocator, "size_swa", None), swa_free
+            )
+
+        for ct in self.tree_components:
+            name = str(ct)
+            fields[f"{name}_evictable"] = self.component_evictable_size_.get(ct, 0)
+            fields[f"{name}_protected"] = self.component_protected_size_.get(ct, 0)
+            fields[f"{name}_dev_lru"] = len(self.lru_lists[ct].cache)
+            fields[f"{name}_host_lru"] = len(self.host_lru_lists[ct].cache)
+            fields[f"{name}_tree_device"] = (
+                self.component_evictable_size_.get(ct, 0)
+                + self.component_protected_size_.get(ct, 0)
+            )
+
+        if self.cache_controller is not None:
+            cc = self.cache_controller
+            fields["write_policy"] = getattr(cc, "write_policy", None)
+            fields["ongoing_write"] = len(self.ongoing_write_through)
+            fields["ongoing_load"] = len(self.ongoing_load_back)
+            host_pool = getattr(cc, "mem_pool_host", None)
+            if host_pool is not None:
+                host_free = self._safe_call_int(host_pool, "available_size")
+                self._add_capacity_diag(
+                    fields, "host", getattr(host_pool, "size", None), host_free
+                )
+                for entry in getattr(host_pool, "entries", None) or ():
+                    pool_name = str(entry.name)
+                    pool = entry.host_pool
+                    self._add_capacity_diag(
+                        fields,
+                        f"host_{pool_name}",
+                        getattr(pool, "size", None),
+                        self._safe_call_int(pool, "available_size"),
+                    )
+        fields.update(self._tree_residency_diag())
+        return fields
+
+    def _log_cache_diag(
+        self,
+        event: str,
+        *,
+        sample: bool = False,
+        include_pool: bool = False,
+        **fields: Any,
+    ) -> None:
+        if not self._cache_diag_enabled():
+            return
+
+        count = self._cache_diag_counters[event] + 1
+        self._cache_diag_counters[event] = count
+
+        # High-volume events are count-only: skip per-occurrence formatting,
+        # pool queries, and I/O on the eviction/load-back hot paths. Their
+        # accumulated counts are emitted as a single aggregate line on the
+        # capacity-snapshot interval instead.
+        if event in _CACHE_DIAG_NOISY_EVENTS:
+            self._maybe_flush_cache_diag_counters()
+            return
+
+        if not self._cache_diag_should_log(event, count, sample, fields):
+            return
+
+        if include_pool:
+            fields.update(self._pool_diag())
+        fields["seq"] = count
+        formatted = " ".join(
+            f"{key}={self._fmt_diag_value(value)}" for key, value in fields.items()
+        )
+        logger.info("KV_DIAG_CACHE event=%s %s", event, formatted)
+
+    def _add_cache_diag_counter(self, event: str, amount: int = 1) -> None:
+        if not self._cache_diag_enabled() or amount <= 0:
+            return
+        self._cache_diag_counters[event] += int(amount)
+        self._maybe_flush_cache_diag_counters()
+
+    def _record_eviction_request_diag(self, params: EvictParams) -> None:
+        if params.num_tokens > 0:
+            self._add_cache_diag_counter("evict_request_full")
+            self._add_cache_diag_counter("evict_request_full_tokens", params.num_tokens)
+        if params.swa_num_tokens > 0:
+            self._add_cache_diag_counter("evict_request_swa")
+            self._add_cache_diag_counter(
+                "evict_request_swa_tokens", params.swa_num_tokens
+            )
+        if params.num_tokens > 0 and params.swa_num_tokens > 0:
+            self._add_cache_diag_counter("evict_request_full_swa")
+
+    def record_eviction_drive_diag(
+        self,
+        trigger: str,
+        before: dict[ComponentType, int],
+        after: dict[ComponentType, int],
+    ) -> None:
+        for ct in self.tree_components:
+            delta = after.get(ct, 0) - before.get(ct, 0)
+            if delta <= 0:
+                continue
+            self._add_cache_diag_counter(f"evict_{str(ct)}_tokens_by_{trigger}", delta)
+
+    def _maybe_flush_cache_diag_counters(self) -> None:
+        """Emit one aggregated counter line for count-only events, at most once
+        per capacity-snapshot interval. Keeps high-frequency events off the
+        per-event logging path (count + periodic flush instead of print-each)."""
+        now = time.monotonic()
+        last = self._cache_diag_last_log_time.get("counter_flush")
+        if last is not None and now - last < _CACHE_DIAG_CAPACITY_INTERVAL_SEC:
+            return
+        self._cache_diag_last_log_time["counter_flush"] = now
+        parts = []
+        for event in sorted(_CACHE_DIAG_COUNTER_EVENTS):
+            total = self._cache_diag_counters.get(event, 0)
+            if not total:
+                continue
+            delta = total - self._cache_diag_counter_last.get(event, 0)
+            self._cache_diag_counter_last[event] = total
+            parts.append(f"{event}={total}(+{delta})")
+        if parts:
+            capacity_parts = [
+                f"{key}={self._fmt_diag_value(value)}"
+                for key, value in self._capacity_diag().items()
+            ]
+            logger.info(
+                "KV_DIAG_CACHE event=counter_flush %s",
+                " ".join(parts + capacity_parts),
+            )
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -556,6 +1031,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 extra_metric_labels=self.extra_metric_labels,
             )
 
+        self._log_cache_diag(
+            "init_hicache",
+            include_pool=True,
+            write_policy=getattr(server_args, "hicache_write_policy", None),
+            hicache_ratio=getattr(server_args, "hicache_ratio", None),
+            hicache_size=getattr(server_args, "hicache_size", None),
+            swa_full_tokens_ratio=getattr(server_args, "swa_full_tokens_ratio", None),
+            io_backend=getattr(server_args, "hicache_io_backend", None),
+            mem_layout=getattr(server_args, "hicache_mem_layout", None),
+            storage_backend=storage_backend,
+            storage_enabled=(
+                self.cache_controller.enable_storage
+                if self.cache_controller is not None
+                else False
+            ),
+            load_back_threshold=self.load_back_threshold,
+            write_through_threshold=self.write_through_threshold,
+            prefetch_policy=self.prefetch_stop_policy,
+            page_size=self.page_size,
+            tree_components=[str(ct) for ct in self.tree_components],
+            sidecar_pools=[spec.pool_name for spec in self.sidecar_pool_specs],
+        )
+
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
@@ -572,19 +1070,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
+        input_key_len = len(key)
         (
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         )
+        if self._cache_diag_enabled():
+            self._log_cache_diag(
+                "match",
+                sample=True,
+                include_pool=True,
+                input_key_len=input_key_len,
+                device_tokens=len(result.device_indices),
+                host_hit_length=result.host_hit_length,
+                best_value_chunks=best_match_device_value_len,
+                **self._req_diag(params.req),
+                **self._node_diag("best", result.best_match_node),
+                **self._node_diag("last_device", result.last_device_node),
+                **self._node_diag("last_host", result.last_host_node),
+            )
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -607,6 +1121,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return EvictResult()
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
+        self._record_eviction_request_diag(params)
+        self._log_cache_diag(
+            "evict_start",
+            include_pool=True,
+            request_full=params.num_tokens,
+            request_swa=params.swa_num_tokens,
+            request_mamba=params.mamba_num,
+        )
 
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
@@ -618,11 +1140,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.writing_check(write_back=True)
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
-        return EvictResult(
+        result = EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
+        self._log_cache_diag(
+            "evict",
+            include_pool=True,
+            request_full=params.num_tokens,
+            request_swa=params.swa_num_tokens,
+            request_mamba=params.mamba_num,
+            **self._tracker_diag(tracker),
+        )
+        return result
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         result = self.session.try_inc_lock_ref(node)
@@ -697,6 +1228,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        effective_cache_len = None
+        page_aligned_len = None
 
         if is_insert:
             insert_params = InsertParams(
@@ -749,6 +1282,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
+        if self._cache_diag_enabled():
+            self._log_cache_diag(
+                "cache_finished_req",
+                sample=True,
+                include_pool=True,
+                is_insert=is_insert,
+                kv_committed_len=kv_committed_len,
+                effective_cache_len=effective_cache_len,
+                page_aligned_len=page_aligned_len,
+                insert_prefix_len=result.prefix_len if result is not None else None,
+                **self._req_diag(req),
+                **self._node_diag("last", req.last_node),
+            )
+
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -794,6 +1341,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
+                )
+            if self._cache_diag_enabled():
+                self._log_cache_diag(
+                    "cache_unfinished_req",
+                    sample=True,
+                    include_pool=True,
+                    chunked=chunked,
+                    skipped_insert=True,
+                    effective_cache_len=effective_cache_len,
+                    **self._req_diag(req),
+                    **self._node_diag("last", req.last_node),
                 )
             return
 
@@ -851,6 +1409,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 is_finished=False,
                 insert_result=result,
                 insert_params=insert_params,
+            )
+
+        if self._cache_diag_enabled():
+            self._log_cache_diag(
+                "cache_unfinished_req",
+                sample=True,
+                include_pool=True,
+                chunked=chunked,
+                skipped_insert=False,
+                token_ids_len=len(token_ids),
+                effective_cache_len=effective_cache_len,
+                page_aligned_len=page_aligned_len,
+                insert_prefix_len=result.prefix_len,
+                new_prefix_len=len(new_indices),
+                **self._req_diag(req),
+                **self._node_diag("last", req.last_node),
             )
 
     # ---- Internal Helpers ----
@@ -1296,6 +1870,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 lru = lru_lists[ct]
                 if lru.in_list(node):
                     lru.remove_node(node)
+        if device_freed or host_freed:
+            self._log_cache_diag(
+                "component_evict",
+                component=comp.component_type,
+                target=target,
+                device_freed=device_freed,
+                host_freed=host_freed,
+                **self._node_diag("node", node),
+            )
         return device_freed, host_freed
 
     def _iteratively_delete_tombstone_leaf(
@@ -1372,9 +1955,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        self._log_cache_diag(
+            "evict_host_start",
+            include_pool=True,
+            component=component_type,
+            request_tokens=num_tokens,
+        )
         comp = self.components.get(component_type)
         if comp is not None:
             comp.drive_host_eviction(num_tokens, tracker)
+        self._log_cache_diag(
+            "evict_host",
+            include_pool=True,
+            component=component_type,
+            request_tokens=num_tokens,
+            **self._tracker_diag(tracker),
+        )
         return tracker[component_type]
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
@@ -1439,6 +2035,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
         self._update_evictable_leaf_sets(node.parent)
+        if self._cache_diag_enabled():
+            self._log_cache_diag(
+                "evict_to_host",
+                include_pool=True,
+                **self._tracker_diag(tracker),
+                **self._node_diag("node", node),
+            )
 
     def _evict_device_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1452,19 +2055,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         All freed device tokens are accumulated into *tracker*.
         """
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        strategy = "demote"
         if not node.backuped:
             if (
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
+                strategy = "write_back_demote"
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
+                if self._cache_diag_enabled():
+                    self._log_cache_diag(
+                        "evict_device_leaf",
+                        include_pool=True,
+                        strategy=strategy,
+                        **self._tracker_diag(tracker),
+                        **self._node_diag("node", node),
+                    )
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
+                strategy = "delete_unbacked"
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
@@ -1475,8 +2089,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._remove_leaf_from_parent(node)
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
+                if self._cache_diag_enabled():
+                    self._log_cache_diag(
+                        "evict_device_leaf",
+                        include_pool=True,
+                        strategy=strategy,
+                        **self._tracker_diag(tracker),
+                        node_id=node.id,
+                    )
                 return
         self._evict_to_host(node, tracker)
+        if self._cache_diag_enabled():
+            self._log_cache_diag(
+                "evict_device_leaf",
+                include_pool=True,
+                strategy=strategy,
+                **self._tracker_diag(tracker),
+                **self._node_diag("node", node),
+            )
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1495,6 +2125,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)
+        self._log_cache_diag(
+            "evict_host_leaf",
+            include_pool=True,
+            **self._tracker_diag(tracker),
+            node_id=node.id,
+        )
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -1508,6 +2144,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.parent is not self.root_node and not node.parent.backuped
         ):
             if self.write_backup(node.parent) <= 0:
+                self._log_cache_diag(
+                    "write_backup_skip",
+                    reason="parent_backup_failed",
+                    write_back=write_back,
+                    **self._node_diag("node", node),
+                    **self._node_diag("parent", node.parent),
+                )
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -1528,18 +2171,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Pre-evict host if insufficient
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        self._log_cache_diag(
+            "write_backup_start",
+            include_pool=True,
+            write_back=write_back,
+            kv_tokens=kv_tokens,
+            host_avail=host_avail,
+            aux_transfers=self._transfer_diag(aux_xfers),
+            **self._node_diag("node", node),
+        )
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
+                self._log_cache_diag(
+                    "write_backup_fail",
+                    include_pool=True,
+                    reason="host_capacity",
+                    write_back=write_back,
+                    kv_tokens=kv_tokens,
+                    host_avail=host_avail,
+                    needed=needed,
+                    evicted=evicted,
+                    **self._node_diag("node", node),
+                )
                 return 0
 
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
+            self._log_cache_diag(
+                "write_backup_fail",
+                include_pool=True,
+                reason="controller_write",
+                write_back=write_back,
+                kv_tokens=kv_tokens,
+                aux_transfers=self._transfer_diag(aux_xfers),
+                **self._node_diag("node", node),
+            )
             return 0
 
         # Commit
@@ -1560,6 +2232,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self._track_write_through_node(node, lock_params)
+        self._log_cache_diag(
+            "write_backup_success",
+            include_pool=True,
+            write_back=write_back,
+            kv_tokens=kv_tokens,
+            host_tokens=len(host_indices),
+            aux_transfers=self._transfer_diag(aux_xfers),
+            **self._node_diag("node", node),
+        )
         return len(host_indices)
 
     def _track_write_through_node(
@@ -1653,6 +2334,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        self._log_cache_diag(
+            "load_back_start",
+            include_pool=True,
+            kv_tokens=kv_tokens,
+            mem_quota=mem_quota,
+            delta=result.delta,
+            kv_transfer=self._transfer_diag([kv_xfer]),
+            aux_transfers=self._transfer_diag(aux_xfers),
+            **self._req_diag(req),
+            **self._node_diag("best", best_match_node),
+        )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -1660,6 +2354,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
+            self._log_cache_diag(
+                "load_back_skip",
+                include_pool=True,
+                reason=(
+                    "threshold"
+                    if kv_tokens < self.load_back_threshold and not comp_xfers
+                    else "mem_quota"
+                ),
+                kv_tokens=kv_tokens,
+                mem_quota=mem_quota,
+                delta=result.delta,
+                aux_transfers=self._transfer_diag(aux_xfers),
+                **self._req_diag(req),
+                **self._node_diag("best", best_match_node),
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1670,15 +2379,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+            evict_result = self.evict(EvictParams(num_tokens=needed))
+            if evict_result.num_tokens_evicted < needed:
+                self._log_cache_diag(
+                    "load_back_fail",
+                    include_pool=True,
+                    reason="device_capacity",
+                    kv_tokens=kv_tokens,
+                    avail=avail,
+                    needed=needed,
+                    evicted=evict_result.num_tokens_evicted,
+                    **self._req_diag(req),
+                    **self._node_diag("best", best_match_node),
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
 
         # Load H→D
-        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
-        aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=best_match_node.id,
@@ -1687,6 +2405,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            self._log_cache_diag(
+                "load_back_fail",
+                include_pool=True,
+                reason="controller_load",
+                kv_tokens=kv_tokens,
+                aux_transfers=self._transfer_diag(aux_xfers),
+                **self._req_diag(req),
+                **self._node_diag("best", best_match_node),
+            )
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
@@ -1719,6 +2446,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
+        self._log_cache_diag(
+            "load_back_success",
+            include_pool=True,
+            kv_tokens=kv_tokens,
+            device_tokens=len(device_indices),
+            aux_transfers=self._transfer_diag(aux_xfers),
+            locked_host_nodes=1,
+            **self._req_diag(req),
+            **self._node_diag("best", best_match_node),
+        )
         return True
 
     def _build_sidecar_transfers(
@@ -2310,12 +3047,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
+                acked_ids = []
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
+                            acked_ids.append(ack_id)
                 cc.ack_write_queue.clear()
+                if acked_ids:
+                    self._log_cache_diag(
+                        "write_ack",
+                        include_pool=True,
+                        write_back=write_back,
+                        ack_count=len(acked_ids),
+                        ack_ids=acked_ids[:16],
+                    )
                 assert len(self.ongoing_write_through) == 0
             return
 
@@ -2333,12 +3080,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count = finish_count_tensor.item()
 
         # Process completed acks
+        acked_ids = []
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
+                acked_ids.append(ack_id)
             finish_count -= 1
+        if acked_ids:
+            self._log_cache_diag(
+                "write_ack",
+                include_pool=True,
+                write_back=write_back,
+                ack_count=len(acked_ids),
+                ack_ids=acked_ids[:16],
+            )
 
     def loading_check(self) -> None:
         """Poll load-back completions."""
@@ -2357,14 +3114,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
+        acked_ids = []
         while finish_count > 0:
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+                acked_ids.append(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
+        if acked_ids:
+            self._log_cache_diag(
+                "load_ack",
+                include_pool=True,
+                ack_count=len(acked_ids),
+                ack_ids=acked_ids[:16],
+            )
 
     # ---- HiCache: Scheduler Entry Points ----
 
@@ -2401,9 +3167,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            self._log_cache_diag(
+                "init_load_back_start",
+                include_pool=True,
+                mem_quota=mem_quota,
+                host_hit_length=params.host_hit_length,
+                swa_host_hit_length=getattr(req, "swa_host_hit_length", 0),
+                mamba_host_hit_length=getattr(req, "mamba_host_hit_length", 0),
+                **self._req_diag(req),
+                **self._node_diag("best", best_match_node),
+                **self._node_diag("last_device", last_best_match_device_node),
+            )
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
+                    self._log_cache_diag(
+                        "init_load_back_empty",
+                        include_pool=True,
+                        host_hit_length=params.host_hit_length,
+                        **self._req_diag(req),
+                        **self._node_diag("best", best_match_node),
+                        **self._node_diag("last_device", last_best_match_device_node),
+                    )
                     return (
                         self._empty_match_result.device_indices,
                         last_best_match_device_node,
@@ -2414,7 +3199,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     len(new_indices),
                     best_match_node.id,
                 )
+                self._log_cache_diag(
+                    "init_load_back_success",
+                    include_pool=True,
+                    loaded_tokens=len(new_indices),
+                    host_hit_length=params.host_hit_length,
+                    **self._req_diag(req),
+                    **self._node_diag("best", best_match_node),
+                )
                 return new_indices, best_match_node
+
+            self._log_cache_diag(
+                "init_load_back_fail",
+                include_pool=True,
+                host_hit_length=params.host_hit_length,
+                **self._req_diag(req),
+                **self._node_diag("best", best_match_node),
+                **self._node_diag("last_device", last_best_match_device_node),
+            )
 
         return (
             self._empty_match_result.device_indices,
@@ -2432,6 +3234,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        self.log_cache_capacity_snapshot()
+
+    def log_cache_capacity_snapshot(self) -> None:
+        self._log_cache_diag("capacity_snapshot", sample=True, **self._capacity_diag())
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""

@@ -137,6 +137,15 @@ class SWAComponent(TreeComponent):
             if cd.value is not None:
                 n_swa += len(cd.value)
             elif cd.host_value is not None:
+                self.cache._log_cache_diag(
+                    "swa_host_match",
+                    sample=True,
+                    n_swa=n_swa,
+                    sliding_window_size=self.sliding_window_size,
+                    **self.cache._req_diag(params.req),
+                    **self.cache._node_diag("node", node),
+                    **self.cache._node_diag("best", result.best_match_node),
+                )
                 # TODO(hzh): load_back may currently restore a full host-tombstone
                 # segment whose length exceeds sliding_window_size. Once
                 # load_back is constrained to fetch only one sliding window
@@ -179,6 +188,15 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
+            self.cache._log_cache_diag(
+                "swa_overlap_recover",
+                sample=True,
+                mode="full_slice",
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                swa_evicted_seqlen=swa_evicted_seqlen,
+                **self.cache._node_diag("node", node),
+            )
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -191,6 +209,16 @@ class SWAComponent(TreeComponent):
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
+            self.cache._log_cache_diag(
+                "swa_overlap_recover",
+                sample=True,
+                mode="partial_slice",
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                start_idx=start_idx,
+                swa_evicted_seqlen=swa_evicted_seqlen,
+                **self.cache._node_diag("node", node),
+            )
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
             )
@@ -205,6 +233,15 @@ class SWAComponent(TreeComponent):
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
+            self.cache._log_cache_diag(
+                "swa_overlap_recover",
+                sample=True,
+                mode="outside_window",
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                swa_evicted_seqlen=swa_evicted_seqlen,
+                **self.cache._node_diag("node", node),
+            )
             return prefix_len
 
     def should_skip_leaf_creation(
@@ -265,10 +302,20 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self.cache._log_cache_diag(
+                "swa_insert",
+                sample=True,
+                mode="full_node",
+                node_start=node_start,
+                split_pos=split_pos,
+                swa_tokens=len(swa_value),
+                **self.cache._node_diag("node", node),
+            )
         elif split_pos < len(node.key):
             # Node straddles the SWA eviction boundary
             # Split into parent (tombstone, no SWA) and child (with SWA)
             # After _split_node, `node` becomes the child
+            old_node_id = node.id
             self.cache._split_node(node.key, node, split_pos)
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
@@ -276,8 +323,28 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self.cache._log_cache_diag(
+                "swa_insert",
+                sample=True,
+                mode="split_boundary",
+                original_node_id=old_node_id,
+                node_start=node_start,
+                split_pos=split_pos,
+                swa_tokens=len(swa_value),
+                **self.cache._node_diag("node", node),
+                **self.cache._node_diag("parent", node.parent),
+            )
         else:
             # Entire leaf is outside the SWA window — left as a tombstone.
+            self.cache._log_cache_diag(
+                "swa_insert",
+                sample=True,
+                mode="outside_window",
+                node_start=node_start,
+                split_pos=split_pos,
+                node_key_len=len(node.key),
+                **self.cache._node_diag("node", node),
+            )
             return
 
         self._maybe_split_leaf_for_swa_lock(node)
@@ -395,6 +462,7 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
+        before = dict(tracker)
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
@@ -415,6 +483,15 @@ class SWAComponent(TreeComponent):
                 )
                 self.cache._cascade_evict(x, self, tracker)
                 x = x_next
+        self.cache.record_eviction_drive_diag("swa", before, tracker)
+        freed_swa = tracker[ct] - before.get(ct, 0)
+        if request > 0 or freed_swa > 0:
+            self.cache._log_cache_diag(
+                "swa_drive_eviction",
+                include_pool=True,
+                request_tokens=request,
+                freed_swa=freed_swa,
+            )
 
     def acquire_component_lock(
         self,
@@ -591,6 +668,13 @@ class SWAComponent(TreeComponent):
 
             backed_up.reverse()
             nodes.reverse()
+            self.cache._log_cache_diag(
+                "swa_load_back_transfer",
+                backed_up_tokens=sum(len(x) for x in backed_up),
+                n_swa=n_swa,
+                node_ids=[n.id for n in nodes],
+                **self.cache._node_diag("best", node),
+            )
 
             return [
                 PoolTransfer(
@@ -678,6 +762,12 @@ class SWAComponent(TreeComponent):
                 allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
                 offset += n_tokens
             assert offset == len(xfer.host_indices)
+            self.cache._log_cache_diag(
+                "swa_load_back_commit",
+                restored_tokens=offset,
+                node_ids=[n.id for n in xfer.nodes_to_load or ()],
+                **self.cache._node_diag("best", node),
+            )
             return
 
         if phase == CacheTransferPhase.PREFETCH:
@@ -798,3 +888,9 @@ class SWAComponent(TreeComponent):
                 )
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
             x = x_next
+        self.cache._log_cache_diag(
+            "swa_drive_host_eviction",
+            include_pool=True,
+            request_tokens=num_tokens,
+            freed_swa=tracker[ct],
+        )
