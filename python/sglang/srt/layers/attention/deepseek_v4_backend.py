@@ -1402,18 +1402,24 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
-        # Prefill MTP draft-extend is dynamic-shape and runs eagerly. Sparse
-        # prefill otherwise reads req_to_token/full_to_swa lazily in its first
-        # layer, so materialize that chunk snapshot at the metadata boundary.
+        # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in
+        # its first layer. Materialize the chunk snapshot at the metadata
+        # boundary for the speculative prefill phases that publish an early
+        # read-done event: EAGLE draft-extend and DFLASH/DSPARK target prefill.
         from sglang.srt.speculative.spec_info import SpecInputType
 
         spec_info = forward_batch.spec_info
-        is_prefill_draft_extend = (
+        snapshot_shared_prefill_reads = (
             forward_batch.forward_mode == ForwardMode.EXTEND
-            and spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+            and (
+                self.model_runner.spec_algorithm.is_dflash_family()
+                or (
+                    spec_info is not None
+                    and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+                )
+            )
         )
-        if is_prefill_draft_extend:
+        if snapshot_shared_prefill_reads:
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert extend_seq_lens_cpu is not None
             num_qo_tokens = sum(extend_seq_lens_cpu)
