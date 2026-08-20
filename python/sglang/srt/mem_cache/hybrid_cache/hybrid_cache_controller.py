@@ -407,6 +407,13 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
+        self.write_queue.clear()
+        if self.io_backend == "direct":
+            self._enqueue_direct_dispatch(self._start_writing_op, op)
+        else:
+            self._start_writing_op(op)
+
+    def _start_writing_op(self, op: CacheOperation) -> None:
         # Page-first staged write-back kernels need CPU destination host indices.
         # A HostPoolGroup may mix staged and non-staged child pools, so let it
         # normalize indices per child instead of moving the whole operation here.
@@ -427,7 +434,6 @@ class HybridCacheController(BaseHiCacheController):
             host_indices, device_indices, resolved_pool_transfers = (
                 self.move_hybrid_indices(op)
             )
-        self.write_queue.clear()
         start_event = device_module.Event()
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
         start_event.record()
@@ -551,12 +557,20 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        if self.io_backend == "direct":
+            self._enqueue_direct_dispatch(self._start_loading_op, op, producer_id)
+        else:
+            self._start_loading_op(op, producer_id)
+        return producer_id
+
+    def _start_loading_op(self, op: CacheOperation, producer_id: int) -> None:
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
+        producer_event = self.layer_done_counter.events[producer_id]
 
         ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
 
@@ -629,7 +643,6 @@ class HybridCacheController(BaseHiCacheController):
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
-        return producer_id
 
     def _record_transfer_indices_on_stream(
         self,

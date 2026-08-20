@@ -168,6 +168,25 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
     def tearDown(self):
         manager_cache_controller._timing_events_supported.cache_clear()
 
+    def test_background_thread_device_resolves_missing_cuda_index(self):
+        with mock.patch.object(
+            manager_cache_controller.device_module,
+            "current_device",
+            return_value=3,
+        ) as current_device:
+            resolved = manager_cache_controller._resolve_background_thread_device(
+                "cuda"
+            )
+
+        self.assertEqual(resolved, 3)
+        current_device.assert_called_once_with()
+
+    def test_background_thread_device_keeps_explicit_index(self):
+        resolved = manager_cache_controller._resolve_background_thread_device(
+            torch.device("cuda:2")
+        )
+        self.assertEqual(resolved, torch.device("cuda:2"))
+
     def _patched_transfers(self, src_registry=None, module=MEMORY_POOL_HOST_MODULE):
         staged_side_effect = None
         if src_registry is not None:
@@ -903,6 +922,57 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_direct_cache_controller_defers_index_copy_to_dispatch_thread(self):
+        op = ManagerCacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller.move_indices = mock.Mock(
+            side_effect=AssertionError("scheduler must not copy direct indices")
+        )
+
+        controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        controller._enqueue_direct_dispatch.assert_called_once_with(
+            controller._start_writing_op, op
+        )
+        controller.move_indices.assert_not_called()
+
+    def test_direct_hybrid_controller_defers_all_pool_index_copies(self):
+        op = CacheOperation(
+            host_indices=_indices(0, 4),
+            device_indices=_indices(4, 8),
+            node_id=1,
+            pool_transfers=[
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    host_indices=_indices(0, 4),
+                    device_indices=_indices(4, 8),
+                )
+            ],
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.write_queue = [op]
+        controller.io_backend = "direct"
+        controller._enqueue_direct_dispatch = mock.Mock()
+        controller.move_hybrid_indices = mock.Mock(
+            side_effect=AssertionError("scheduler must not copy direct indices")
+        )
+
+        controller.start_writing()
+
+        self.assertEqual(controller.write_queue, [])
+        controller._enqueue_direct_dispatch.assert_called_once_with(
+            controller._start_writing_op, op
+        )
+        controller.move_hybrid_indices.assert_not_called()
 
 
 if __name__ == "__main__":
