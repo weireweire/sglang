@@ -377,7 +377,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         full_indices = free_index.to(torch.int64)
-        swa_indices = self.full_to_swa_index_mapping[full_indices]
+        # CUDA advanced indexing performs a host-blocking bounds check here,
+        # draining the in-flight prefill forward under overlap scheduling.
+        swa_indices = torch.index_select(
+            self.full_to_swa_index_mapping, 0, full_indices
+        )
         if getattr(self.full_attn_allocator, "debug_mode", False):
             assert torch.all(
                 swa_indices > 0
@@ -431,7 +435,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_indices > 0
             ).item(), "dense SWA window release encountered an unmapped token"
         self.swa_attn_allocator.free_segment(swa_indices, start_pos=start_pos)
-        self.full_to_swa_index_mapping[full_indices] = 0
+        self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
     def _free_swa_legacy(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
