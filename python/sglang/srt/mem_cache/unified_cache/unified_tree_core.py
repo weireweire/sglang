@@ -1958,19 +1958,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         rebuild is deferred to the orchestration layer."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        # Pin every node whose host slots the in-flight DMA reads (including
-        # aux-only nodes) against reclaim until the ack.
-        for xfers in ([kv_xfer], *comp_xfers.values()):
-            for xfer in xfers:
-                for nid in xfer.nodes_to_load or ():
-                    pinned = self.node_by_id(nid)
-                    # One live load-back per node; only the same anchor may
-                    # re-pin (a node can sit in Full and aux transfer lists).
-                    assert pinned.load_back_pending_id in (None, node_id), (
-                        f"node {nid} pinned by load-back "
-                        f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                    )
-                    pinned.load_back_pending_id = node_id
+        # Pin Full KV host slots against write-back duplicate reclaim until the
+        # ack. Auxiliary pools have their own host locks and may legitimately
+        # load the same radix node under a different anchor.
+        for nid in kv_xfer.nodes_to_load or ():
+            pinned = self.node_by_id(nid)
+            # One live Full KV load-back per node; only the same anchor may
+            # re-pin it.
+            assert pinned.load_back_pending_id in (None, node_id), (
+                f"node {nid} pinned by load-back "
+                f"{pinned.load_back_pending_id}, new anchor {node_id}"
+            )
+            pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
