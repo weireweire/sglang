@@ -34,14 +34,16 @@ def maybe_publish_prefill_shared_read_done(
         if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
             return
     else:
-        # Prefill MTP draft-extend is the speculative step's last reader of
-        # scheduler-owned mappings. Target prefill and verify must not publish.
-        spec_info = forward_batch.spec_info
-        if (
-            spec_info is None
-            or spec_info.spec_input_type != SpecInputType.EAGLE_DRAFT_EXTEND
-        ):
-            return
+        if not model_runner.spec_algorithm.is_dflash_family():
+            # Preserve the existing EAGLE prefill draft-extend path. DFLASH and
+            # DSPARK have no separate prefill draft-extend, so their target
+            # EXTEND is the last shared-buffer reader.
+            spec_info = forward_batch.spec_info
+            if (
+                spec_info is None
+                or spec_info.spec_input_type != SpecInputType.EAGLE_DRAFT_EXTEND
+            ):
+                return
     # The record lands right after replay prep, so PRE_REPLAY only.
     boundary = model_runner.attn_backend.shared_read_boundary(
         forward_batch.forward_mode

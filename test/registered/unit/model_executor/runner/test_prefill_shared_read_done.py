@@ -65,7 +65,18 @@ def test_prefill_draft_extend_publishes_without_non_spec_prefill_flag():
     batch = _batch(spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
         maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
-    published = runner.war_fastpath_read_done_event
+    published = runner.shared_read_done_event
+    assert isinstance(published, _Event) and published.recorded
+
+
+@pytest.mark.parametrize(
+    "algorithm", (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK)
+)
+def test_dflash_family_target_prefill_publishes_without_non_spec_flag(algorithm):
+    runner = _model_runner(spec_algorithm=algorithm)
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
+        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+    published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
 
