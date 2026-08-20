@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,9 +11,13 @@ from sglang.srt.disaggregation.prefill import (
 class _Event:
     def __init__(self):
         self.recorded = False
+        self.ready = True
 
     def record(self):
         self.recorded = True
+
+    def query(self):
+        return self.ready
 
 
 class _Allocator:
@@ -111,3 +115,77 @@ def test_stage_cached_prefix_skips_partial_page():
 
     copy_page_ids.assert_not_called()
     assert not hasattr(req, "_staged_cached_prefix_transfer_indices")
+
+
+def test_cached_prefix_early_send_does_not_wait_for_staging_copy():
+    ready_event = _Event()
+    ready_event.ready = False
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        early_send_prefix_end=8,
+        prefix_indices=torch.arange(12),
+        host_hit_length=4,
+        start_send_idx=0,
+        _staged_cached_prefix_transfer_indices=SimpleNamespace(
+            end_idx=8,
+            ready_event=ready_event,
+        ),
+    )
+    scheduler = SimpleNamespace(
+        enable_staging=True,
+        enable_overlap=True,
+        token_to_kv_pool_allocator=_Allocator(),
+        send_kv_chunk=Mock(),
+    )
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.envs."
+            "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get",
+            return_value=True,
+        ),
+        patch("torch.cuda.Event") as cuda_event,
+    ):
+        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+            scheduler, req
+        )
+
+    scheduler.send_kv_chunk.assert_not_called()
+    cuda_event.assert_not_called()
+
+
+def test_cached_prefix_early_send_uses_ready_staging_copy():
+    ready_event = _Event()
+    req = SimpleNamespace(
+        pending_bootstrap=False,
+        early_send_prefix_end=8,
+        prefix_indices=torch.arange(12),
+        host_hit_length=4,
+        start_send_idx=0,
+        _staged_cached_prefix_transfer_indices=SimpleNamespace(
+            end_idx=8,
+            ready_event=ready_event,
+        ),
+        disagg_kv_sender=SimpleNamespace(),
+    )
+    scheduler = SimpleNamespace(
+        enable_staging=True,
+        enable_overlap=False,
+        token_to_kv_pool_allocator=_Allocator(),
+        send_kv_chunk=Mock(),
+    )
+
+    with (
+        patch(
+            "sglang.srt.disaggregation.prefill.envs."
+            "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get",
+            return_value=True,
+        ),
+    ):
+        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
+            scheduler, req
+        )
+
+    scheduler.send_kv_chunk.assert_called_once_with(
+        req, last_chunk=False, end_idx=8
+    )

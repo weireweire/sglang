@@ -1332,6 +1332,20 @@ class SchedulerDisaggregationPrefillMixin:
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
             return
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = getattr(
+            req, "_staged_cached_prefix_transfer_indices", None
+        )
+        if (
+            staged_prefix is not None
+            and staged_prefix.end_idx >= cached_end
+            and not staged_prefix.ready_event.query()
+        ):
+            # Early-send is optional. Under overlap scheduling the pinned D2H
+            # can still be behind the previous forward. Waiting here blocks
+            # the scheduler and turns one slow DP rank into an all-gather idle
+            # gap on every rank. Retry on the request's next chunk; if there
+            # is no next chunk, the regular final send covers the full range.
+            return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
