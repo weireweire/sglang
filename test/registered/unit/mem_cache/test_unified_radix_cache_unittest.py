@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -252,6 +253,82 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         n4.parent = n3
         n4.hash_value = ["h4"]
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+
+
+class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
+    def _build_core(self):
+        component_types = (ComponentType.FULL, ComponentType.SWA)
+        root = UnifiedTreeNode(component_types)
+        shared = UnifiedTreeNode(component_types)
+        descendant = UnifiedTreeNode(component_types)
+        shared.parent = root
+        descendant.parent = shared
+
+        nodes = {node.id: node for node in (root, shared, descendant)}
+        core = mock.Mock()
+        core.root_node = root
+        core.node_by_id.side_effect = nodes.__getitem__
+        core.components_by_type = {
+            component_type: mock.Mock() for component_type in component_types
+        }
+        core.full_host_duplicates = {}
+        core._is_settled_full_host_duplicate.side_effect = lambda node: (
+            UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
+        )
+        core._update_duplicate_tracking.side_effect = lambda node: (
+            UnifiedTreeCore._update_duplicate_tracking(core, node)
+        )
+        return core, shared, descendant
+
+    def _commit_load_back(self, core, anchor, *, full_nodes=(), swa_nodes=()):
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1] * len(full_nodes), dtype=torch.int64),
+            nodes_to_load=[node.id for node in full_nodes],
+        )
+        comp_xfers = {}
+        if swa_nodes:
+            comp_xfers[ComponentType.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor(
+                        [2] * len(swa_nodes), dtype=torch.int64
+                    ),
+                    nodes_to_load=[node.id for node in swa_nodes],
+                )
+            ]
+        return UnifiedTreeCore.commit_load_back(
+            core,
+            anchor.id,
+            torch.tensor([3] * len(full_nodes), dtype=torch.int64),
+            kv_xfer,
+            comp_xfers,
+        )
+
+    def test_auxiliary_overlap_does_not_replace_full_pending_anchor(self):
+        core, shared, descendant = self._build_core()
+        full = shared.component_data[ComponentType.FULL]
+        full.value = torch.tensor([1], dtype=torch.int64)
+        full.host_value = torch.tensor([2], dtype=torch.int64)
+
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        # A later request may load an auxiliary pool for the shared ancestor
+        # while the descendant's Full KV DMA is still in flight.
+        self._commit_load_back(core, shared, swa_nodes=(shared,))
+        UnifiedTreeCore.finish_load_back(core, shared.id)
+        self.assertEqual(shared.load_back_pending_id, descendant.id)
+
+        UnifiedTreeCore.finish_load_back(core, descendant.id)
+        self.assertIsNone(shared.load_back_pending_id)
+
+    def test_full_overlap_with_different_anchor_is_still_rejected(self):
+        core, shared, descendant = self._build_core()
+        self._commit_load_back(core, descendant, full_nodes=(shared,))
+
+        with self.assertRaisesRegex(AssertionError, "new anchor"):
+            self._commit_load_back(core, shared, full_nodes=(shared,))
 
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
