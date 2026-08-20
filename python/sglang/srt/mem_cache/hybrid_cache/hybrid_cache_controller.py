@@ -52,9 +52,11 @@ class CacheOperation(BaseCacheOperation):
         node_id: int,
         priority: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        device_values_ready_event=None,
     ):
         super().__init__(host_indices, device_indices, node_id, priority)
         self.pool_transfers = pool_transfers
+        self.device_values_ready_event = device_values_ready_event
 
     @staticmethod
     def merge_pool_transfers(
@@ -99,6 +101,14 @@ class CacheOperation(BaseCacheOperation):
             -1,
             priority,
             pool_transfers=CacheOperation.merge_pool_transfers(ops),
+            device_values_ready_event=next(
+                (
+                    op.device_values_ready_event
+                    for op in reversed(ops)
+                    if op.device_values_ready_event is not None
+                ),
+                None,
+            ),
         )
         merged.node_ids = node_ids
         return merged
@@ -379,6 +389,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         *,
         defer_start: bool = False,
+        device_values_ready_event=None,
     ) -> Optional[torch.Tensor]:
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
@@ -400,6 +411,7 @@ class HybridCacheController(BaseHiCacheController):
                 node_id,
                 priority,
                 pool_transfers=pool_transfers or None,
+                device_values_ready_event=device_values_ready_event,
             )
         )
         if not defer_start:
@@ -409,12 +421,34 @@ class HybridCacheController(BaseHiCacheController):
     def start_writing(self) -> None:
         if not self.write_queue:
             return
-        op = CacheOperation.merge_ops(self.write_queue)
-        self.write_queue.clear()
+        ops = self.write_queue
+        self.write_queue = []
         if self.io_backend == "direct":
-            self._enqueue_direct_dispatch(self._start_writing_op, op)
+            dependency = next(
+                (
+                    op.device_values_ready_event
+                    for op in reversed(ops)
+                    if op.device_values_ready_event is not None
+                ),
+                None,
+            )
+            self._enqueue_direct_dispatch(
+                self._merge_and_start_writing_ops,
+                ops,
+                dependency=dependency,
+            )
         else:
-            self._start_writing_op(op)
+            self._start_writing_op(CacheOperation.merge_ops(ops))
+
+    def _merge_and_start_writing_ops(self, ops: list[CacheOperation]) -> None:
+        """Merge direct-I/O indices on the helper's CUDA stream.
+
+        CUDA ``cat`` and dtype normalization are themselves device work.  They
+        must be ordered after the tree-value readiness dependency and must not
+        be appended to the scheduler stream before that dependency is handed
+        to the helper.
+        """
+        self._start_writing_op(CacheOperation.merge_ops(ops))
 
     def _start_writing_op(self, op: CacheOperation) -> None:
         # Page-first staged write-back kernels need CPU destination host indices.
@@ -736,8 +770,15 @@ class HybridCacheController(BaseHiCacheController):
         if operation.pool_transfers:
             resolved_pool_transfers = []
             for transfer in operation.pool_transfers:
+                transfer_device_indices = transfer.device_indices
+                if (
+                    self.io_backend == "direct"
+                    and transfer_device_indices is not None
+                    and transfer_device_indices.dtype != torch.int64
+                ):
+                    transfer_device_indices = transfer_device_indices.to(torch.int64)
                 transfer_host_indices, transfer_device_indices = self.move_indices(
-                    transfer.host_indices, transfer.device_indices
+                    transfer.host_indices, transfer_device_indices
                 )
                 # Keep the original PoolTransfer unchanged because tree-owned
                 # transfers may still reference radix-tree host state. The

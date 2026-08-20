@@ -383,10 +383,11 @@ class HiCacheController:
             finally:
                 self._direct_dispatch_queue.task_done()
 
-    def _enqueue_direct_dispatch(self, fn, *args) -> None:
+    def _enqueue_direct_dispatch(self, fn, *args, dependency=None) -> None:
         self.check_direct_dispatch_error()
-        dependency = device_module.Event()
-        dependency.record()
+        if dependency is None:
+            dependency = device_module.Event()
+            dependency.record()
         self._direct_dispatch_queue.put((dependency, fn, args))
 
     def check_direct_dispatch_error(self) -> None:
