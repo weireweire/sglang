@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,11 @@ def _make_num_token_non_padded(
 ) -> Optional[torch.Tensor]:
     if not enable_num_token_non_padded():
         return None
-    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
+    return torch.tensor(
+        num_tokens,
+        dtype=torch.int32,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
