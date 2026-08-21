@@ -375,7 +375,13 @@ class HiCacheController:
                 # CUDA current streams are thread-local.  Wait on the event
                 # recorded by the scheduler before Tensor.cpu() observes the
                 # allocator output from its current forward stream.
-                dependency.synchronize()
+                dependencies = (
+                    dependency
+                    if isinstance(dependency, (list, tuple))
+                    else (dependency,)
+                )
+                for event in dependencies:
+                    event.synchronize()
                 fn(*args)
             except BaseException as exc:
                 self._direct_dispatch_error = exc

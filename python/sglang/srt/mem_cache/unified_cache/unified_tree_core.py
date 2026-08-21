@@ -136,6 +136,10 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # Readiness of CUDA index tensors owned by this node. Direct HiCache
+        # eviction must not wait on unrelated, newer mutations elsewhere in
+        # the radix tree.
+        self.device_values_ready_event = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -440,12 +444,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # The single in-flight resumable insert, if suspended at a barrier.
         self._ongoing_insert_walk_state: Optional[_InsertWalkState] = None
-
-        # Direct HiCache write-back runs index conversion on a helper thread.
-        # Keep one rolling event at the last tree-owned CUDA-index mutation so
-        # that helper waits only for the values it will read, not for unrelated
-        # forwards appended later to the scheduler's current stream.
-        self._device_values_ready_event = None
 
         self.root_node = self._new_node()
         self.root_node.priority = -sys.maxsize
@@ -1106,7 +1104,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
-        self._record_device_values_ready()
+        self._record_device_values_ready(new_node)
+        self._record_device_values_ready(child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # A split of a backuped node tells the cache to fix its publish list.
@@ -1146,7 +1145,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
-        self._record_device_values_ready()
+        self._record_device_values_ready(new_node)
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
@@ -1167,7 +1166,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
-        self._record_device_values_ready()
+        self._record_device_values_ready(node)
         self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
@@ -2060,29 +2059,24 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert component_type != BASE_COMPONENT_TYPE
         node = self.node_by_id(node_id)
         node.component_data[component_type].value = value
-        self._record_device_values_ready()
+        self._record_device_values_ready(node)
         host_lru = self.host_lru_lists[component_type]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
         self.lru_lists[component_type].insert_mru(node)
         self.component_evictable_size_[component_type] += len(value)
 
-    def _record_device_values_ready(self) -> None:
-        """Publish readiness of the latest tree-owned CUDA index mutation.
-
-        Replacing the previous event is safe because all tree mutations are
-        ordered on the scheduler's current stream.  A later event therefore
-        covers every device index currently reachable from the tree.
-        """
+    def _record_device_values_ready(self, node: UnifiedTreeNode) -> None:
+        """Publish readiness of CUDA index mutations owned by ``node``."""
         if torch.device(self.device).type == "cpu":
             return
         event = device_module.Event()
         event.record()
-        self._device_values_ready_event = event
+        node.device_values_ready_event = event
 
-    def device_values_ready_event(self):
+    def device_values_ready_event(self, node_id: NodeId):
         """Return the narrow dependency for direct D->H index conversion."""
-        return self._device_values_ready_event
+        return self.node_by_id(node_id).device_values_ready_event
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType

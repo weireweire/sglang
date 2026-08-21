@@ -101,14 +101,12 @@ class CacheOperation(BaseCacheOperation):
             -1,
             priority,
             pool_transfers=CacheOperation.merge_pool_transfers(ops),
-            device_values_ready_event=next(
-                (
-                    op.device_values_ready_event
-                    for op in reversed(ops)
-                    if op.device_values_ready_event is not None
-                ),
-                None,
-            ),
+            device_values_ready_event=tuple(
+                op.device_values_ready_event
+                for op in ops
+                if op.device_values_ready_event is not None
+            )
+            or None,
         )
         merged.node_ids = node_ids
         return merged
@@ -424,14 +422,11 @@ class HybridCacheController(BaseHiCacheController):
         ops = self.write_queue
         self.write_queue = []
         if self.io_backend == "direct":
-            dependency = next(
-                (
-                    op.device_values_ready_event
-                    for op in reversed(ops)
-                    if op.device_values_ready_event is not None
-                ),
-                None,
-            )
+            dependency = tuple(
+                op.device_values_ready_event
+                for op in ops
+                if op.device_values_ready_event is not None
+            ) or None
             self._enqueue_direct_dispatch(
                 self._merge_and_start_writing_ops,
                 ops,
