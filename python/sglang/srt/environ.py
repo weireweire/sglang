@@ -1065,6 +1065,11 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # 0 derives the launch size from DeepGEMM's current device SM count.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_SMS = EnvInt(0)
+    # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small even
+    # safety margin so every cluster can become resident beside other streams.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
 
     # ===================================================================
     # Top-k kernels
