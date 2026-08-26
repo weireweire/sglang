@@ -623,6 +623,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        # Direct HiCache deliberately prepares transfer indices on a helper
+        # thread.  These helpers assert the final post-DMA cache state, so wait
+        # for that preparation before inspecting the acknowledgement queue;
+        # production scheduling remains asynchronous and polls it next step.
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -3951,6 +3956,7 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -4434,6 +4440,7 @@ class UnifiedRadixCacheSuite:
     def _finish_pending_loads(self, cache):
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -6458,6 +6465,41 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
             indices
         )
+
+    def test_flush_write_back_batch_waits_before_demoting(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.write_queue = [mock.sentinel.pending_write]
+        cache.ongoing_write_through = {}
+        cache.writing_check = mock.Mock()
+        cache._demote = mock.Mock()
+        tracker = {ComponentType.FULL: 0}
+        node_ids = [11, 12]
+        calls = mock.Mock()
+        calls.attach_mock(cache.cache_controller.start_writing, "start")
+        calls.attach_mock(cache.writing_check, "wait")
+        calls.attach_mock(cache._demote, "demote")
+
+        cache._flush_write_back_eviction_batch(node_ids, tracker)
+
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                mock.call.start(),
+                mock.call.wait(write_back=True),
+                mock.call.demote(11, tracker),
+                mock.call.demote(12, tracker),
+            ],
+        )
+        self.assertEqual(node_ids, [])
+
+    def test_flush_write_back_batch_is_noop_without_hicache(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = None
+        cache.ongoing_write_through = {}
+        tracker = {ComponentType.FULL: 0}
+
+        cache._flush_write_back_eviction_batch([], tracker)
 
     def test_apply_component_action_device_kv_swa_uses_free_swa(self):
         cache = mock.MagicMock()

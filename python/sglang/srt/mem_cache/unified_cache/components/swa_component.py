@@ -295,6 +295,7 @@ class SWAComponent(TreeComponent):
                 )
                 return 0
             full_cd.value = value_slice.clone()
+            self.tree_core._record_device_values_ready(node)
             cache_actions.append(FreeDeviceKV([old_full]))
             cache_actions.append(SWARebuild(node.id, value_slice))
             return 0
@@ -313,6 +314,7 @@ class SWAComponent(TreeComponent):
                 )
                 return start_idx
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
+            self.tree_core._record_device_values_ready(node)
             cache_actions.append(FreeDeviceKV([old_full]))
             cache_actions.append(SWARebuild(node.id, new_full))
             return start_idx
@@ -829,7 +831,10 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=cd.value.to(torch.int64),
+                    # Direct I/O normalizes this on its helper stream after the
+                    # tree-value readiness event.  Converting here would append
+                    # CUDA work to the scheduler stream after that event.
+                    device_indices=cd.value,
                 )
             ]
 
