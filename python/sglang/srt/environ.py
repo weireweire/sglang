@@ -1272,10 +1272,11 @@ class Envs:
     # ===================================================================
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
     # --grpc-port CLI flag; setting either enables the native server alongside
-    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
-    # surface).
+    # HTTP. The worker-threads and response-timeout knobs stay env-only
+    # (internal tuning, no CLI surface).
     SGLANG_GRPC_PORT = EnvInt(None)
     SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
+    SGLANG_GRPC_RESPONSE_TIMEOUT_SECS = EnvInt(300)
 
     # ===================================================================
     # NUMA and CPU affinity

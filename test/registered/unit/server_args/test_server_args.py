@@ -2698,6 +2698,7 @@ class TestGrpcServerArgs(CustomTestCase):
         self.addCleanup(override.restore)
         server_args = SimpleNamespace(grpc_worker_threads=4)
         with (
+            envs.SGLANG_GRPC_RESPONSE_TIMEOUT_SECS.override(1800),
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension",
                 return_value=fake_core,
@@ -2718,8 +2719,16 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 

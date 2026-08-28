@@ -2759,6 +2759,7 @@ def _start_native_grpc_server_for_runtime(
         port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=server_args.grpc_worker_threads,
+        response_timeout_secs=envs.SGLANG_GRPC_RESPONSE_TIMEOUT_SECS.get(),
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
