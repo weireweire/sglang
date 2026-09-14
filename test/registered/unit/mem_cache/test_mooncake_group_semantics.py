@@ -423,21 +423,19 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
 
-    def test_v2_multi_buffer_put_passes_group_ids(self):
+    def test_v2_multi_buffer_put_filters_existing_pages(self):
         store, fake_store = _make_store(extra_backend_tag="tag", is_mla_model=True)
-        multi_buffer_pool = FakeMultiBufferPool()
-        store.register_mem_host_pool_v2(multi_buffer_pool, PoolName.DEEPSEEK_V4_C4)
+        pool = FakeMultiBufferPool()
+        store.register_mem_host_pool_v2(pool, PoolName.DEEPSEEK_V4_C4)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                keys=["page0", "page1"],
+                host_indices=torch.tensor([0, 1]),
+            )
+        ]
 
-        result = store.batch_set_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    keys=["page0", "page1"],
-                    host_indices=torch.tensor([0, 1]),
-                )
-            ]
-        )
-
+        result = store.batch_set_v2(transfers)
         self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [True, True])
         call = fake_store.batch_put_calls[0]
         self.assertEqual(call["method"], "batch_put_from_multi_buffers")
@@ -451,6 +449,28 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+        with patch.object(
+            pool, "get_page_buffer_meta", wraps=pool.get_page_buffer_meta
+        ) as meta:
+            self.assertEqual(
+                store.batch_set_v2(transfers)[PoolName.DEEPSEEK_V4_C4], [True, True]
+            )
+            meta.assert_not_called()
+        self.assertEqual(len(fake_store.batch_put_calls), 1)
+
+        fake_store.existing_keys.remove("tag_page1__deepseek_v4_c4")
+        with patch.object(
+            pool, "get_page_buffer_meta", return_value=([4010, 4011], [8, 16])
+        ) as meta:
+            self.assertEqual(
+                store.batch_set_v2(transfers)[PoolName.DEEPSEEK_V4_C4], [True, True]
+            )
+            self.assertEqual(meta.call_args.args[0].tolist(), [1])
+        call = fake_store.batch_put_calls[-1]
+        self.assertEqual(call["keys"], ["tag_page1__deepseek_v4_c4"])
+        self.assertEqual(call["ptrs"], [[4010, 4011]])
+        self.assertEqual(call["args"][0].group_ids, ["sglang-hicache:tag_page1"])
 
     def test_model_names_isolate_the_same_logical_key(self):
         store_a, fake_store_a = _make_store(
