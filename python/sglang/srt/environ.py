@@ -640,6 +640,11 @@ class Envs:
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
+    # Minimum local radix-node hit count before a direct external linker stores
+    # the node.  Values above one avoid admitting one-shot prompt tails.
+    SGLANG_EXTERNAL_LINKER_WRITE_THROUGH_THRESHOLD = EnvInt(1)
+    # 0 preserves dense admission; positive values retain periodic SWA windows.
+    SGLANG_EXTERNAL_LINKER_SWA_RETENTION_INTERVAL = EnvInt(0)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # Deprecated: the unified radix tree is the default tree cache now, so the
@@ -752,6 +757,9 @@ class Envs:
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
+    # Let decode ranks contribute embedded CPU memory to a Mooncake store used
+    # by prefill-side external-cache linkers, without enabling cache I/O on decode.
+    SGLANG_MOONCAKE_STORE_CONTRIBUTOR = EnvBool(False)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)

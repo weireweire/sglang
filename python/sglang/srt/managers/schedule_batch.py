@@ -2183,6 +2183,22 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def _compute_chunked_req_next_prompt_tokens(
+    reqs: List[Req],
+    chunked_reqs: Optional[List[Req]],
+    vocab_size: int,
+) -> Optional[List[Optional[int]]]:
+    if not chunked_reqs:
+        return None
+    chunked_set = set(chunked_reqs)
+    return [
+        _compute_chunked_req_next_prompt_token(req, vocab_size)
+        if req in chunked_set
+        else None
+        for req in reqs
+    ]
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2215,6 +2231,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
+    chunked_reqs: Optional[List[Req]] = None
+    chunked_req_next_prompt_tokens: Optional[List[Optional[int]]] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -2389,6 +2407,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        chunked_reqs: Optional[List[Req]] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -2412,6 +2431,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
+                model_config.vocab_size,
+            ),
+            chunked_reqs=chunked_reqs,
+            chunked_req_next_prompt_tokens=_compute_chunked_req_next_prompt_tokens(
+                reqs,
+                chunked_reqs,
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,

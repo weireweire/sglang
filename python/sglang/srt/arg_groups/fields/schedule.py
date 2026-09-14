@@ -60,6 +60,10 @@ class Schedule:
         Optional[int],
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
     ] = None
+    prefill_chunk_size_per_request: A[
+        Optional[int],
+        "The maximum number of prefill tokens contributed by one request to a batch. Unlike chunked-prefill-size, this is a per-request cap and is not divided by DP size.",
+    ] = None
     prefill_decode_interval: A[
         int,
         "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
