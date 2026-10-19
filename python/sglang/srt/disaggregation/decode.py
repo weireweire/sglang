@@ -3084,6 +3084,8 @@ class SchedulerDisaggregationDecodeMixin:
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        late_admission = envs.SGLANG_ENABLE_DISAGG_DECODE_LATE_ADMISSION.get()
+
         while True:
             if self.gracefully_exit:
                 break
@@ -3097,7 +3099,8 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.process_decode_queue()
+            if not late_admission:
+                self.process_decode_queue()
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
@@ -3125,6 +3128,11 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 batch_result = None
                 self._sched_idled = True
+
+            # Admit while the launched forward runs, so one rank's admission work
+            # does not hold every DP rank at the next MLP sync.
+            if late_admission:
+                self.process_decode_queue()
 
             # Process the last batch
             if self.last_batch:
