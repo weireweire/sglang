@@ -38,7 +38,11 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
+from sglang.kernels.ops.speculative.dspark.sampled_accept_tail import (
+    sampled_accept_tail,
+)
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -105,6 +109,18 @@ def sampling_accept_commit_lens(
     if epilogue.simulated_correct_len is not None:
         bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
         bonus_logits = None
+    if envs.SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_TAIL.get():
+        return _sampled_accept_tail(
+            io,
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            verify_lens=verify_lens,
+            gate=gate,
+            gated=gated,
+            epilogue=epilogue,
+            tp_sync=tp_sync,
+        )
     commit_lens = build_accept_outs(
         correct_len=correct_len,
         bonus=bonus,
@@ -123,6 +139,115 @@ def sampling_accept_commit_lens(
     if not gated:
         return None
     return torch.minimum(commit_lens, verify_lens.to(torch.int32)) * gate
+
+
+def _sampled_accept_tail(
+    io: StaticVerifyIO,
+    *,
+    correct_len: torch.Tensor,
+    bonus: torch.Tensor,
+    cap_trim_lens: torch.Tensor,
+    verify_lens: torch.Tensor,
+    gate: torch.Tensor,
+    gated: bool,
+    epilogue: DsparkVerifyEpilogue,
+    tp_sync: SpecTpSync,
+) -> Optional[torch.Tensor]:
+    """build_accept_outs into the static buffers, the gated commit lengths and the
+    future relay scatter in one launch; the same values bit for bit."""
+    bs = io.candidates.shape[0]
+    if epilogue.simulated_correct_len is not None:
+        correct_len = epilogue.simulated_correct_len.repeat(bs).to(correct_len.dtype)
+    site = SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+    tp_sync.sync(site, correct_len)
+    tp_sync.sync(site, bonus)
+    tp_sync.sync(site, cap_trim_lens)
+    out = epilogue.read_accept(bs)
+    gated_commit_lens = torch.empty((bs,), dtype=torch.int32, device=correct_len.device)
+    _log_sampled_accept_tail(bs)
+    sampled_accept_tail(
+        correct_len=correct_len,
+        bonus=bonus,
+        cap_trim_lens=cap_trim_lens,
+        seq_lens=io.seq_lens[:bs],
+        candidates=io.candidates,
+        verify_lens=verify_lens,
+        gate=gate,
+        correct_len_out=out.correct_len,
+        bonus_out=out.bonus,
+        cap_trim_lens_out=out.cap_trim_lens,
+        commit_lens_out=out.commit_lens,
+        new_seq_lens_out=out.new_seq_lens,
+        out_tokens_out=out.out_tokens,
+        gated_commit_lens_out=gated_commit_lens,
+        block_accept_lens_out=epilogue.read_block_accept_lens(bs),
+        relay=epilogue.take_future_relay(io.req_pool_indices, bs),
+    )
+    if envs.SGLANG_DEBUG_DSPARK_SAMPLED_ACCEPT_TAIL_CHECK.get() and not (
+        torch.cuda.is_current_stream_capturing()
+    ):
+        _check_sampled_accept_tail(
+            io,
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            verify_lens=verify_lens,
+            gate=gate,
+            epilogue=epilogue,
+            tp_sync=tp_sync,
+            gated_commit_lens=gated_commit_lens,
+        )
+    return gated_commit_lens if gated else None
+
+
+def _check_sampled_accept_tail(
+    io, *, correct_len, bonus, cap_trim_lens, verify_lens, gate, epilogue, tp_sync,
+    gated_commit_lens,
+) -> None:
+    bs, stride = io.candidates.shape
+    got = epilogue.read_accept(bs)
+    ref = AcceptOuts(*(t.clone() for t in got))
+    block = epilogue.read_block_accept_lens(bs)
+    ref_block = None if block is None else block.clone()
+    build_accept_outs(
+        correct_len=correct_len,
+        bonus=bonus,
+        cap_trim_lens=cap_trim_lens,
+        prefix_lens=io.seq_lens[:bs],
+        draft_tokens=io.candidates[:, 1:].contiguous(),
+        gamma=stride - 1,
+        verify_num_draft_tokens=stride,
+        tp_sync=tp_sync,
+        sync_site=SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE,
+        out=ref,
+        block_accept_lens_out=ref_block,
+    )
+    ref_gated = torch.minimum(ref.commit_lens, verify_lens.to(torch.int32)) * gate
+    pairs = [(f, getattr(got, f), getattr(ref, f)) for f in AcceptOuts.__struct_fields__]
+    pairs.append(("gated", gated_commit_lens, ref_gated))
+    if block is not None:
+        pairs.append(("block", block, ref_block))
+    relay = epilogue.future_relay
+    if relay is not None and epilogue._relay_taken:
+        rows = io.req_pool_indices[:bs].to(torch.int64)
+        pairs.append(("relay_seq", relay.new_seq_lens[rows], ref.new_seq_lens))
+        pairs.append(("relay_tok", relay.output_tokens[rows], ref.bonus))
+    bad = [f for f, x, y in pairs if x.dtype != y.dtype or not torch.equal(x, y)]
+    logger.info(
+        "DSpark sampled accept tail check bs=%d: %s",
+        bs,
+        "bitwise equal (%d outputs)" % len(pairs) if not bad else f"MISMATCH {bad}",
+    )
+
+
+_sampled_accept_tail_logged: set[int] = set()
+
+
+def _log_sampled_accept_tail(bs: int) -> None:
+    if bs in _sampled_accept_tail_logged or not torch.cuda.is_current_stream_capturing():
+        return
+    _sampled_accept_tail_logged.add(bs)
+    logger.info("DSpark sampling-accept graph bs=%d: fused sampled accept tail", bs)
 
 
 class DsparkSamplingAcceptGraph:

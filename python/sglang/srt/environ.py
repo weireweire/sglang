@@ -608,6 +608,10 @@ class Envs:
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
+    # DSpark sampling-accept graph: the accept bookkeeping (finalize, out tokens, block and
+    # gated commit lengths, future relay scatter) in one launch instead of about seven.
+    SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_TAIL = EnvBool(False)
+    SGLANG_DEBUG_DSPARK_SAMPLED_ACCEPT_TAIL_CHECK = EnvBool(False)
     # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
     # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(

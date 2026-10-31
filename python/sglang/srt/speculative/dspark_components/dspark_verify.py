@@ -611,6 +611,8 @@ class DsparkVerifyEpilogue:
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
+        # Set by run_static's accept when it scattered the future relay itself.
+        self._relay_taken = False
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
         # stage the commit's stores into it; the next draft forward runs them.
@@ -776,6 +778,7 @@ class DsparkVerifyEpilogue:
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
+        self._relay_taken = False
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
@@ -785,7 +788,7 @@ class DsparkVerifyEpilogue:
             verify_lens,
             gate,
         )
-        if self._post_fold:
+        if self._post_fold and not self._relay_taken:
             self._scatter_future_relay(io.req_pool_indices, bs)
         if not folds:
             return committed_engram
@@ -944,11 +947,29 @@ class DsparkVerifyEpilogue:
         )
         return True
 
+    def take_future_relay(
+        self, req_pool_indices: torch.Tensor, bs: int
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """For an accept inside run_static that scatters the relay itself: (slots,
+        new_seq_lens table, output_tokens table); run_static then skips its scatter."""
+        if not self._post_fold or not self._ensure_future_relay(req_pool_indices):
+            return None
+        self._relay_taken = True
+        relay = self.future_relay
+        return req_pool_indices[:bs], relay.new_seq_lens, relay.output_tokens
+
     def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
         """Unconditional: a step that takes another accept publishes and stashes on
         the host afterwards. Padded rows index slot 0, every pool's dummy row."""
-        if self.commit_ctx is None:
+        if not self._ensure_future_relay(req_pool_indices):
             return
+        rows = req_pool_indices[:bs].to(torch.int64)
+        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
+        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
+
+    def _ensure_future_relay(self, req_pool_indices: torch.Tensor) -> bool:
+        if self.commit_ctx is None:
+            return False
         if self.future_relay is None:
             assert not (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -958,9 +979,7 @@ class DsparkVerifyEpilogue:
                 device=req_pool_indices.device,
             )
             offer_future_relay_buffers(self.future_relay)
-        rows = req_pool_indices[:bs].to(torch.int64)
-        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
-        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
+        return True
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
