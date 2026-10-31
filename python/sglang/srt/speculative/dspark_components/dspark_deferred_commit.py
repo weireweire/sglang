@@ -38,6 +38,30 @@ logger = logging.getLogger(__name__)
 _LOG_EVERY = 4096
 
 
+def _joint_columns(kvs: List[torch.Tensor]) -> Optional[torch.Tensor]:
+    """``kvs`` as one [rows, sum of widths] view when they are adjacent column slices
+    of one row-major tensor (the stacked projection's strided outputs), else None."""
+    first = kvs[0]
+    if len(kvs) < 2 or first.dim() != 2 or first.stride(1) != 1:
+        return None
+    width = sum(kv.shape[1] for kv in kvs)
+    if first.stride(0) != width:
+        return None
+    offset = first.storage_offset()
+    for kv in kvs:
+        if (
+            kv.dim() != 2
+            or kv.dtype != first.dtype
+            or kv.shape[0] != first.shape[0]
+            or kv.stride() != first.stride()
+            or kv.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+            or kv.storage_offset() != offset
+        ):
+            return None
+        offset += kv.shape[1]
+    return first.as_strided((first.shape[0], width), (width, 1))
+
+
 class DeferredContextCommit:
     def __init__(
         self,
@@ -53,6 +77,9 @@ class DeferredContextCommit:
         self._kv_injector = kv_injector
         # Per draft stage [max_rows, kv width], made at the first (warmup) projection.
         self.kvs: Optional[List[torch.Tensor]] = None
+        # With column-adjacent projections, one [max_rows, sum of widths] buffer whose
+        # column splits are ``kvs``, filled by one copy.
+        self._kvs_joint: Optional[torch.Tensor] = None
         rows = self._max_rows
         self.cache_loc = torch.zeros((rows,), dtype=torch.int64, device=device)
         self.positions = torch.zeros((rows,), dtype=torch.int64, device=device)
@@ -114,12 +141,21 @@ class DeferredContextCommit:
             kvs = self._kv_injector.draft_model.project_commit_kv(
                 main_hidden=pack_aux_hidden_states(aux), pool=self._pool()
             )
+            joint = _joint_columns(kvs)
             if self.kvs is None:
                 assert not _capturing(), "the commit KV buffers are made at a warmup"
-                self.kvs = [kv.new_zeros((self._max_rows, kv.shape[1])) for kv in kvs]
+                if joint is not None:
+                    self._kvs_joint = joint.new_zeros((self._max_rows, joint.shape[1]))
+                    self.kvs = list(self._kvs_joint.split([kv.shape[1] for kv in kvs], dim=1))
+                else:
+                    self._kvs_joint = None
+                    self.kvs = [kv.new_zeros((self._max_rows, kv.shape[1])) for kv in kvs]
             n = kvs[0].shape[0]
-            for buf, kv in zip(self.kvs, kvs):
-                buf[:n].copy_(kv)
+            if joint is not None and self._kvs_joint is not None:
+                self._kvs_joint[:n].copy_(joint)
+            else:
+                for buf, kv in zip(self.kvs, kvs):
+                    buf[:n].copy_(kv)
             self._proj_done.record()
         self._proj_unjoined = True
 
