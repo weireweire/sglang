@@ -2102,6 +2102,11 @@ class Envs:
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark static verify: a disarmed step (the accept runs after the verify graph)
+    # replays the verify graph with its in-graph greedy accept and commits switched off.
+    SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

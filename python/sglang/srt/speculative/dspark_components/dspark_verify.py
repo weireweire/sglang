@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Optional
 
@@ -44,6 +45,9 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.skippable_graph_nodes import (
+    SKIPPABLE,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -674,6 +678,10 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # A disarmed replay runs the static epilogue's nodes as empty nodes.
+        self._skips_disarmed_epilogue = (
+            envs.SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.get()
+        )
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -701,6 +709,7 @@ class DsparkVerifyEpilogue:
 
     def begin_step(self, verify_lens, armed: bool) -> None:
         self._static_step_state = None
+        SKIPPABLE.enabled = armed
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -711,6 +720,7 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(1 if armed else 0)
 
     def begin_static_step(self, bs: int, armed: bool) -> None:
+        SKIPPABLE.enabled = armed
         state = (bs, armed)
         if self._static_step_state == state:
             return
@@ -746,9 +756,15 @@ class DsparkVerifyEpilogue:
         )
         if capturing:
             self.static_io[bs] = io
-        committed_engram = self.run_static(
-            io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+        region = (
+            SKIPPABLE.region()
+            if self._skips_disarmed_epilogue
+            else contextlib.nullcontext()
         )
+        with region:
+            committed_engram = self.run_static(
+                io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+            )
         if committed_engram and capturing:
             self.folds_engram_commit = True
 

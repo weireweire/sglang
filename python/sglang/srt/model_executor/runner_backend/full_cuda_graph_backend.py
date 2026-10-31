@@ -36,6 +36,10 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.skippable_graph_nodes import (
+    SKIPPABLE,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -180,7 +184,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        # A kept raw graph lets a replay switch captured regions off (SKIPPABLE).
+        keep_graph = envs.SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.get()
+        graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -210,6 +216,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
                 if shared_output is not None:
                     out = shared_output
 
+        if keep_graph:
+            graph.instantiate()
         if profiler is not None:
             profiler.step()
 
@@ -231,12 +239,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        graph = self._graphs[shape_key]
+        SKIPPABLE.apply(graph)
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            graph.replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
         for graph in self._graphs.values():
+            SKIPPABLE.forget(graph)
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
