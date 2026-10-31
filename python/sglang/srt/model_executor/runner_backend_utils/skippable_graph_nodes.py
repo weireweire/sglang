@@ -1,16 +1,17 @@
 """Captured CUDA-graph regions a replay can switch off (cudaGraphNodeSetEnabled).
 
 A region records the kernel / memcpy / memset nodes its ops added to the graph being
-captured on the current stream. A graph backend that keeps its raw graphs calls
-``apply`` before each replay: the regions are enabled iff ``SKIPPABLE.enabled``, and
-a disabled node runs as an empty node, keeping its dependencies.
+captured on the current stream, under a group name. A graph backend that keeps its raw
+graphs calls ``apply`` before each replay: each group's regions are enabled iff
+``SKIPPABLE.enabled[group]`` (default on), and a disabled node runs as an empty node,
+keeping its dependencies.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -29,16 +30,18 @@ def _graph_nodes(graph) -> List:
 
 
 class SkippableGraphNodes:
+    DEFAULT = "epilogue"
+
     def __init__(self) -> None:
-        self.enabled = True
-        # raw graph handle -> the region nodes captured into it
-        self._nodes: Dict[int, List] = {}
-        # raw graph exec handle -> whether its region nodes are enabled now
-        self._state: Dict[int, bool] = {}
+        self.enabled: Dict[str, bool] = {}
+        # (raw graph handle, group) -> the region nodes captured into it
+        self._nodes: Dict[Tuple[int, str], List] = {}
+        # (raw graph exec handle, group) -> whether its region nodes are enabled now
+        self._state: Dict[Tuple[int, str], bool] = {}
         self.num_toggles = 0
 
     @contextlib.contextmanager
-    def region(self):
+    def region(self, group: str = DEFAULT):
         """Record the nodes the ops inside add to the current stream's capture."""
         if rt is None or not torch.cuda.is_current_stream_capturing():
             yield
@@ -63,37 +66,42 @@ class SkippableGraphNodes:
             if int(n) not in before
             and checkCudaErrors(rt.cudaGraphNodeGetType(n)) in kinds
         ]
-        self._nodes.setdefault(int(graph), []).extend(added)
+        self._nodes.setdefault((int(graph), group), []).extend(added)
 
     def apply(self, graph: torch.cuda.CUDAGraph) -> None:
         if not self._nodes:
             return
         try:
-            nodes = self._nodes.get(int(graph.raw_cuda_graph()))
+            raw = int(graph.raw_cuda_graph())
+            graph_exec = int(graph.raw_cuda_graph_exec())
         except RuntimeError:
             return
-        if not nodes:
-            return
-        graph_exec = int(graph.raw_cuda_graph_exec())
-        want = self.enabled
-        if self._state.get(graph_exec, True) == want:
-            return
-        for node in nodes:
-            checkCudaErrors(rt.cudaGraphNodeSetEnabled(graph_exec, node, int(want)))
-        self._state[graph_exec] = want
-        self.num_toggles += 1
-        if self.num_toggles == 1:
-            logger.info(
-                "Captured graph regions switched %s (%d nodes) for this replay.",
-                "on" if want else "off",
-                len(nodes),
-            )
+        for (graph_raw, group), nodes in self._nodes.items():
+            if graph_raw != raw or not nodes:
+                continue
+            want = self.enabled.get(group, True)
+            if self._state.get((graph_exec, group), True) == want:
+                continue
+            for node in nodes:
+                checkCudaErrors(rt.cudaGraphNodeSetEnabled(graph_exec, node, int(want)))
+            self._state[(graph_exec, group)] = want
+            self.num_toggles += 1
+            if self.num_toggles <= 2:
+                logger.info(
+                    "Captured graph region %s switched %s (%d nodes) for this replay.",
+                    group,
+                    "on" if want else "off",
+                    len(nodes),
+                )
 
     def forget(self, graph: torch.cuda.CUDAGraph) -> None:
         with contextlib.suppress(RuntimeError):
-            self._nodes.pop(int(graph.raw_cuda_graph()), None)
+            raw = int(graph.raw_cuda_graph())
+            for key in [k for k in self._nodes if k[0] == raw]:
+                del self._nodes[key]
         with contextlib.suppress(RuntimeError):
-            self._state.pop(int(graph.raw_cuda_graph_exec()), None)
-
+            graph_exec = int(graph.raw_cuda_graph_exec())
+            for key in [k for k in self._state if k[0] == graph_exec]:
+                del self._state[key]
 
 SKIPPABLE = SkippableGraphNodes()

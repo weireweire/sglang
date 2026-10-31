@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -42,6 +43,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         sharded_accept: bool = False,
         out=None,
+        buffers: Optional["DraftSamplerBuffers"] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -81,15 +83,15 @@ class DsparkDraftSampler:
         self._noise = noise
         self._tp_sync = tp_sync
         # Staged before each replay.
-        self.params = DraftParams(
-            temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
-            greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),
-            step_temperatures=torch.zeros(
-                (self.max_bs,), dtype=torch.float32, device=device
-            ),
+        self.params = (
+            _make_draft_params(self.max_bs, device) if buffers is None else buffers.params
+        )
+        adopted_step_logits = (
+            None if buffers is None or greedy_draft else buffers.step_logits
         )
         # [max_bs, gamma, vocab] step logits for sampling accept. The stock path
-        # sizes it on first use; a bound specialized path may allocate it now.
+        # sizes it on first use unless adopted; a bound specialized path may
+        # allocate it now.
         bound_strategy = bind_dspark_draft_strategy(
             draft_model=self.model,
             gamma=self.gamma,
@@ -100,21 +102,33 @@ class DsparkDraftSampler:
             step_temperatures=self.params.step_temperatures,
             # Temperature-0 rows may be left unwritten, while mixed accept still
             # reads the entire buffer.
-            allocate_step_logits=lambda: torch.zeros(
-                (
-                    self.max_bs,
-                    self.gamma,
-                    _step_logits_width(self.model, self.sharded_accept),
-                ),
-                dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
-                device=self.out.device,
+            allocate_step_logits=lambda: (
+                adopted_step_logits
+                if adopted_step_logits is not None
+                else torch.zeros(
+                    (
+                        self.max_bs,
+                        self.gamma,
+                        _step_logits_width(self.model, self.sharded_accept),
+                    ),
+                    dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
+                    device=self.out.device,
+                )
             ),
         )
         self._draft_strategy = bound_strategy.strategy
-        self.step_logits = bound_strategy.step_logits
+        self.step_logits: Optional[torch.Tensor] = (
+            bound_strategy.step_logits
+            if bound_strategy.step_logits is not None
+            else adopted_step_logits
+        )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
-        if self.step_logits is None:
+        if self.step_logits is not None:
+            assert self.step_logits.dtype == self.markov_head.step_logits_dtype(
+                base_logits.dtype
+            )
+        else:
             # The runner's warmup calls the tail eagerly before capture.
             # torch.cuda's capture query raises on XPU builds.
             capturing = (
@@ -190,6 +204,41 @@ class DsparkDraftSampler:
         return draft_tokens, confidence_features
 
 
+class DraftSamplerBuffers(msgspec.Struct, frozen=True):
+    """The draft sampler's static buffers, made before the sampler so a verify graph
+    captured first can read them."""
+
+    params: DraftParams
+    # None for a greedy draft.
+    step_logits: Optional[torch.Tensor]
+    greedy_draft: bool
+
+
+def make_draft_sampler_buffers(
+    *, model, gamma: int, max_bs: int, device, greedy_draft: bool, sharded_accept: bool
+) -> DraftSamplerBuffers:
+    step_logits = None
+    if not greedy_draft:
+        step_logits = torch.zeros(
+            (max_bs, gamma, _step_logits_width(model, sharded_accept)),
+            dtype=model.markov_head.step_logits_dtype(torch.bfloat16),
+            device=device,
+        )
+    return DraftSamplerBuffers(
+        params=_make_draft_params(max_bs, device),
+        step_logits=step_logits,
+        greedy_draft=greedy_draft,
+    )
+
+
+def _make_draft_params(max_bs: int, device) -> DraftParams:
+    return DraftParams(
+        temperatures=torch.ones((max_bs,), dtype=torch.float32, device=device),
+        greedy_mask=torch.ones((max_bs,), dtype=torch.bool, device=device),
+        step_temperatures=torch.zeros((max_bs,), dtype=torch.float32, device=device),
+    )
+
+
 def _step_logits_width(model, sharded_accept: bool) -> int:
     if sharded_accept:
         return int(model.lm_head.num_embeddings_per_partition)
@@ -209,6 +258,7 @@ def maybe_build_draft_sampler(
     tp_sync: SpecTpSync,
     sharded_accept: bool = False,
     out=None,
+    buffers: Optional[DraftSamplerBuffers] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -232,6 +282,7 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         sharded_accept=sharded_accept,
         out=out,
+        buffers=buffers,
     )
     if tp_rank == 0:
         logger.info(

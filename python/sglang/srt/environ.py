@@ -612,6 +612,10 @@ class Envs:
     # gated commit lengths, future relay scatter) in one launch instead of about seven.
     SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_TAIL = EnvBool(False)
     SGLANG_DEBUG_DSPARK_SAMPLED_ACCEPT_TAIL_CHECK = EnvBool(False)
+    # DSpark static verify: the sampling-accept region is captured into the verify graph
+    # as a branch beside the greedy fold, switched on for the steps that would replay it.
+    # Needs SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.
+    SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_FOLD = EnvBool(False)
     # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
     # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(

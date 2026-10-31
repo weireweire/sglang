@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -72,8 +73,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    make_draft_sampler_buffers,
+)
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
+    sampling_accept_commit_lens,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -156,6 +161,9 @@ class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
     _sampling_accept_graph = None
+    _draft_sampler_buffers = None
+    _sampled_fold = False
+    num_sampled_fold_steps = 0
     _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
@@ -469,6 +477,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=self.device,
                     rejection_noise=self._rejection_noise,
                 )
+                self._maybe_attach_sampled_fold()
 
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
@@ -615,6 +624,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+                self._sampled_fold = self._sampled_fold_adopted()
             commit = self._deferred_commit()
             if commit is not None:
                 self._wire_deferred_commit(commit)
@@ -697,6 +707,63 @@ class DSparkWorkerV2(BaseSpecWorker):
             "head of the next draft graph, joined at its first KV store."
         )
 
+    def _maybe_attach_sampled_fold(self) -> None:
+        """SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_FOLD: the verify graphs, captured before
+        the draft sampler, read its buffers made here; the sampler adopts them."""
+        if not (
+            envs.SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_FOLD.get()
+            and envs.SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.get()
+            and envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            and self.draft_model.markov_head is not None
+        ):
+            return
+        self._draft_sampler_buffers = make_draft_sampler_buffers(
+            model=self.draft_model,
+            gamma=self.gamma,
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            device=self.device,
+            greedy_draft=self._greedy_draft,
+            sharded_accept=self._sharded_accept,
+        )
+        self._verify_epilogue.attach_sampled_fold(
+            partial(
+                sampling_accept_commit_lens,
+                draft_sampler=self._draft_sampler_buffers,
+                epilogue=self._verify_epilogue,
+                tp_sync=self._tp_sync,
+                block_verification=get_spec().speculative_use_block_verification,
+                rejection_noise=self._rejection_noise,
+            )
+        )
+
+    def _sampled_fold_adopted(self) -> bool:
+        buffers = self._draft_sampler_buffers
+        sampler = self._draft_sampler
+        adopted = (
+            buffers is not None
+            and sampler is not None
+            and sampler.params is buffers.params
+            and sampler.step_logits is buffers.step_logits
+        )
+        if buffers is not None and self._target_tp_rank == 0:
+            logger.info(
+                "DSpark sampling accept folded into the verify graph: %s.",
+                "on" if adopted else "off (the draft sampler does not read its buffers)",
+            )
+        return adopted
+
+    def _sampled_fold_step(self, *, bs: int, eligible: bool, sampling_info) -> bool:
+        """Whether this static verify replay runs its sampled-accept branch."""
+        if not (self._sampled_fold and eligible):
+            return False
+        watermark_state = self.target_worker.model_runner.watermark_state
+        # The watermark rewrites the logits after the replay.
+        if watermark_state is not None and sampling_info.has_watermark_candidates:
+            return False
+        epilogue = self._verify_epilogue
+        graph_bs = min((b for b in epilogue.static_io if b >= bs), default=None)
+        return graph_bs in epilogue.sampled_fold_bs
+
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
@@ -713,6 +780,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            buffers=self._draft_sampler_buffers,
         )
 
     def clear_cache_pool(self):
@@ -1155,6 +1223,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        sampled_fold = False
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1173,7 +1242,25 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._verify_epilogue is not None
                     and self._verify_planner.mode_value == "static"
                 ):
-                    self._verify_epilogue.begin_static_step(bs, fold_eligible)
+                    sampled_fold = self._sampled_fold_step(
+                        bs=bs,
+                        eligible=not fold_eligible
+                        and self._sampling_graph_eligible(
+                            batch=batch,
+                            proposal_folded=proposal.folded,
+                            sampling_info=sampling_info,
+                            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                        ),
+                        sampling_info=sampling_info,
+                    )
+                    if sampled_fold:
+                        self._stage_sampled_fold_sim_bonus(
+                            bs=bs,
+                            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                        )
+                    self._verify_epilogue.begin_static_step(
+                        bs, fold_eligible, sampled=sampled_fold
+                    )
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
                     draft_input=draft_input,
@@ -1211,7 +1298,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             and (run_compact or self._verify_planner.mode_value == "static")
         )
         region_accept = None
-        if (
+        region_engram = False
+        if sampled_fold and can_run_cuda_graph:
+            graph_bs = min(b for b in epilogue.static_io if b >= bs)
+            assert (
+                target_logits.data_ptr() == epilogue.static_io[graph_bs].logits.data_ptr()
+            ), "the folded sampling accept read another replay's logits"
+            region_accept = epilogue.read_accept(bs)
+            region_engram = epilogue.sampled_fold_engram
+            self.num_sampled_fold_steps += 1
+            if self.num_sampled_fold_steps == 1:
+                logger.info("Sampling accept ran in the verify graph (first step).")
+        elif (
             not folded_accept
             and can_run_cuda_graph
             and not run_compact
@@ -1229,6 +1327,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             region_accept = self._sampling_accept_graph.run(
                 bs=bs, target_logits=target_logits
             )
+            region_engram = self._sampling_accept_graph.committed_engram
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
         graph_accept = folded_accept or region_accept is not None
@@ -1259,9 +1358,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
-        ) or (
-            region_accept is not None and self._sampling_accept_graph.committed_engram
-        )
+        ) or (region_accept is not None and region_engram)
         # The static verify graph committed the engram history when it folded the accept.
         if not engram_in_graph:
             self.model_runner.ngram_embedding_manager.update_after_verify(
@@ -1439,6 +1536,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self.num_relayed_in_graph_steps == 1:
             logger.info("Seq lens and bonus relayed by the verify graph (first step).")
         return relay
+
+    def _stage_sampled_fold_sim_bonus(self, *, bs: int, simulate_bonus_sampling_info):
+        """The sim bonus buffers the separate region would stage after the replay."""
+        epilogue = self._verify_epilogue
+        if simulate_bonus_sampling_info is None or (
+            self._sim_draw_ahead and epilogue.simulate_fold
+        ):
+            return
+        epilogue.begin_sim_bonus(bs, simulate_bonus_sampling_info.temperatures[:bs])
 
     def _begin_simulated_step_ahead(self, *, bs: int, simulate_bonus_sampling_info):
         """Issued before the draft launch (neither write depends on it); a step that

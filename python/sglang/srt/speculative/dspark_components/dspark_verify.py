@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -76,6 +76,9 @@ from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
+
+# The SKIPPABLE group of the static epilogue's sampled branch.
+_SAMPLED_FOLD = "sampled_accept"
 
 _is_npu = is_npu()
 
@@ -684,6 +687,14 @@ class DsparkVerifyEpilogue:
         self._skips_disarmed_epilogue = (
             envs.SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.get()
         )
+        # SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_FOLD: the sampling accept region as a
+        # second static-epilogue branch, switched on for the steps that would replay it.
+        self._sampled_fold_accept: Optional[Callable] = None
+        self._sampled_fold_gate: Optional[torch.Tensor] = None
+        self._sampled_fold_stream: Optional[torch.cuda.Stream] = None
+        # Captured static batch sizes whose verify graph holds the sampled branch.
+        self.sampled_fold_bs: set[int] = set()
+        self.sampled_fold_engram = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -709,9 +720,21 @@ class DsparkVerifyEpilogue:
             bs=forward_batch.batch_size,
         )
 
+    def attach_sampled_fold(self, accept: Callable) -> None:
+        """Before the verify graphs are captured: ``accept`` is the sampling accept
+        (sampling_accept_commit_lens bound to its inputs) of the sampled branch."""
+        assert self._skips_disarmed_epilogue
+        self._sampled_fold_accept = accept
+        self._sampled_fold_gate = torch.ones(
+            (1,), dtype=torch.int32, device=self.inject_gate_buf.device
+        )
+        # Off until a step asks for it, also for replays no begin_*step precedes.
+        SKIPPABLE.enabled[_SAMPLED_FOLD] = False
+
     def begin_step(self, verify_lens, armed: bool) -> None:
         self._static_step_state = None
-        SKIPPABLE.enabled = armed
+        SKIPPABLE.enabled[SKIPPABLE.DEFAULT] = armed
+        SKIPPABLE.enabled[_SAMPLED_FOLD] = False
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -721,8 +744,12 @@ class DsparkVerifyEpilogue:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
 
-    def begin_static_step(self, bs: int, armed: bool) -> None:
-        SKIPPABLE.enabled = armed
+    def begin_static_step(self, bs: int, armed: bool, sampled: bool = False) -> None:
+        """``sampled``: this replay runs the sampled branch (the caller checked
+        sampled_fold_bs); the greedy fold is then disarmed."""
+        assert not (armed and sampled)
+        SKIPPABLE.enabled[SKIPPABLE.DEFAULT] = armed
+        SKIPPABLE.enabled[_SAMPLED_FOLD] = sampled
         state = (bs, armed)
         if self._static_step_state == state:
             return
@@ -763,18 +790,58 @@ class DsparkVerifyEpilogue:
             if self._skips_disarmed_epilogue
             else contextlib.nullcontext()
         )
+        fold = self._sampled_fold_accept is not None
+        if fold and capturing:
+            # Fork before the greedy branch, so the sampled one waits only on the logits.
+            self._fork_sampled_fold()
         with region:
             committed_engram = self.run_static(
                 io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
             )
         if committed_engram and capturing:
             self.folds_engram_commit = True
+        if fold:
+            self._sampled_fold_branch(io, capturing=capturing)
+
+    def _fork_sampled_fold(self) -> None:
+        if self._sampled_fold_stream is None:
+            self._sampled_fold_stream = torch.cuda.Stream()
+        self._sampled_fold_stream.wait_stream(torch.cuda.current_stream())
+
+    def _sampled_fold_branch(self, io: StaticVerifyIO, *, capturing: bool) -> None:
+        """The sampling accept region's ops on a forked stream; eagerly (warmups) they
+        run after the greedy branch, which writes the same buffers."""
+        main = torch.cuda.current_stream()
+        if not capturing:
+            self._fork_sampled_fold()
+        with torch.cuda.stream(self._sampled_fold_stream), SKIPPABLE.region(
+            _SAMPLED_FOLD
+        ):
+            committed_engram = self.run_static(
+                io,
+                accept=self._sampled_fold_accept,
+                gate=self._sampled_fold_gate,
+                rejoin=True,
+            )
+        main.wait_stream(self._sampled_fold_stream)
+        if capturing:
+            bs = io.candidates.shape[0]
+            self.sampled_fold_bs.add(bs)
+            self.sampled_fold_engram = committed_engram
+            logger.info("DSpark verify graph bs=%d: sampling accept folded in.", bs)
 
     def run_static(
-        self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False
+        self,
+        io: StaticVerifyIO,
+        *,
+        accept,
+        gate: torch.Tensor,
+        kv_projected=False,
+        rejoin=False,
     ) -> bool:
         """Run ``accept`` into the accept buffers, then the commits gated by ``gate``;
-        returns whether the engram history was committed."""
+        returns whether the engram history was committed. ``rejoin``: a second epilogue
+        branch, which waits for the projection the first one joined."""
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
@@ -802,7 +869,9 @@ class DsparkVerifyEpilogue:
                 .contiguous()
             )
         commit = self.deferred_commit
-        if commit is not None and (kv_projected or commit.join_projection()):
+        if commit is not None and (
+            kv_projected or commit.join_projection(again=rejoin)
+        ):
             commit.stage(
                 cache_loc=cache_loc,
                 positions=io.positions,

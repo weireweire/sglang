@@ -102,6 +102,8 @@ class DeferredContextCommit:
         self.staged_bs = 0
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
+        # Host: the static epilogue joined this graph's projection; a second branch may too.
+        self._proj_rejoinable = False
         # Host, capture only: forked stores the draft's first KV store has not joined yet.
         self._fork_unjoined = False
         # Draft graph batch sizes whose capture recorded the forked stores.
@@ -158,13 +160,19 @@ class DeferredContextCommit:
                     buf[:n].copy_(kv)
             self._proj_done.record()
         self._proj_unjoined = True
+        self._proj_rejoinable = False
 
-    def join_projection(self) -> bool:
-        """In the static epilogue: wait for this graph's projection; False if none ran."""
-        if not self._proj_unjoined:
+    def join_projection(self, *, again: bool = False) -> bool:
+        """In the static epilogue: wait for this graph's projection; False if none ran.
+        ``again``: a second epilogue branch waits for the projection the first joined."""
+        if again:
+            if not self._proj_rejoinable:
+                return False
+        elif not self._proj_unjoined:
             return False
         torch.cuda.current_stream().wait_event(self._proj_done)
         self._proj_unjoined = False
+        self._proj_rejoinable = True
         return True
 
     def stage(
@@ -307,6 +315,7 @@ class DeferredContextCommit:
         self.staged_bs = 0
         self._fork_unjoined = False
         self._proj_unjoined = False
+        self._proj_rejoinable = False
 
 
 def _capturing() -> bool:
