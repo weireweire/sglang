@@ -206,7 +206,8 @@ def _check_sampled_accept_tail(
 ) -> None:
     bs, stride = io.candidates.shape
     got = epilogue.read_accept(bs)
-    ref = AcceptOuts(*(t.clone() for t in got))
+    fields = AcceptOuts.__struct_fields__
+    ref = AcceptOuts(*(getattr(got, f).clone() for f in fields))
     block = epilogue.read_block_accept_lens(bs)
     ref_block = None if block is None else block.clone()
     build_accept_outs(
@@ -223,7 +224,7 @@ def _check_sampled_accept_tail(
         block_accept_lens_out=ref_block,
     )
     ref_gated = torch.minimum(ref.commit_lens, verify_lens.to(torch.int32)) * gate
-    pairs = [(f, getattr(got, f), getattr(ref, f)) for f in AcceptOuts.__struct_fields__]
+    pairs = [(f, getattr(got, f), getattr(ref, f)) for f in fields]
     pairs.append(("gated", gated_commit_lens, ref_gated))
     if block is not None:
         pairs.append(("block", block, ref_block))
