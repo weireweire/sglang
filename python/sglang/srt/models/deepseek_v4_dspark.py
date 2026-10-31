@@ -11,7 +11,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    CommitKvProj,
+    low_latency_mxfp8_linear,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
@@ -859,7 +862,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> List[torch.Tensor]:
         """The context rows' per-stage KV, before norm / rope / store; reads no KV
         location, so it can run before the accept decides what is committed."""
-        main_x = self.project_target_hidden(main_hidden)
+        stage0 = self.stages[0]
+        proj = stage0.main_proj
+        projected = low_latency_mxfp8_linear(
+            main_hidden, proj.weight, getattr(proj, "weight_scale_inv_swizzled", None)
+        )
+        main_x = (
+            self.project_target_hidden(main_hidden)
+            if projected is None
+            else stage0.main_norm(projected)
+        )
         return CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],

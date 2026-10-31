@@ -203,6 +203,40 @@ def markov_greedy_step_triton(
 _STACKED_WEIGHT_CACHE: dict[int, _StackedWkvWeight] = {}
 
 
+# (N, K) -> FlashInfer cutedsl low-latency tactic at 5-8 rows on GB300: the main
+# projection and the stacked wkv of the DSV4.1-Flash commit KV.
+_COMMIT_LL_TACTICS = {
+    (5120, 15360): (128, 12, 1, 2),
+    (1536, 5120): (128, 12, 1, 4),
+}
+
+
+def low_latency_mxfp8_linear(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """``x @ weight.T`` on FlashInfer's cutedsl low-latency MXFP8 GEMM for 1-8 rows,
+    or None where it does not apply."""
+    rows = x.shape[0]
+    if (
+        weight_scale is None
+        or not 0 < rows <= 8
+        or weight.dtype != torch.float8_e4m3fn
+        or weight.dim() != 2
+        or not weight.is_contiguous()
+        or weight.shape[1] % 128
+    ):
+        return None
+    try:
+        from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    except ImportError:
+        return None
+    if not mxfp8_ll.supported():
+        return None
+    q, sf = mxfp8_ll.quantize(x.contiguous())
+    tactic = _COMMIT_LL_TACTICS.get(tuple(weight.shape)) if rows > 4 else None
+    return mxfp8_ll.linear(q, sf.reshape(-1), weight, weight_scale, tactic=tactic)
+
+
 class CommitKvProj:
     @classmethod
     def execute(
@@ -276,13 +310,17 @@ def commit_kv_proj_fused(
                 ),
             )
         else:
-            kv_all = quant_method.w8a8_mxfp8_linear(
-                input=main_x,
-                weight=stacked.weight,
-                weight_scale=stacked.mxfp8_scale,
-                input_scale=None,
-                bias=None,
+            kv_all = low_latency_mxfp8_linear(
+                main_x, stacked.weight, stacked.mxfp8_scale
             )
+            if kv_all is None:
+                kv_all = quant_method.w8a8_mxfp8_linear(
+                    input=main_x,
+                    weight=stacked.weight,
+                    weight_scale=stacked.mxfp8_scale,
+                    input_scale=None,
+                    bias=None,
+                )
     elif stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
         kv_all = quant_method.w8a8_block_fp8_linear(
