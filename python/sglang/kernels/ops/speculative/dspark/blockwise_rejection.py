@@ -148,6 +148,7 @@ def _stats_kernel(
     STRIDE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
+    SPAN: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -157,12 +158,14 @@ def _stats_kernel(
         # Bonus row: its resample reads raw logits, no stats.
         return
     block_idx = tl.program_id(1)
-    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
+    lane = tl.arange(0, BLOCK)
+    offs = block_idx * SPAN + lane
+    in_span = lane < SPAN
     t_temp = tl.load(target_temp_ptr + req).to(tl.float32)
     t = (
         tl.load(
             target_logits_ptr + row * target_stride + offs,
-            mask=offs < target_vocab,
+            mask=in_span & (offs < target_vocab),
             other=float("-inf"),
         ).to(tl.float32)
         / t_temp
@@ -178,7 +181,7 @@ def _stats_kernel(
         d = (
             tl.load(
                 draft_logits_ptr + req * draft_stride_0 + step * draft_stride_1 + offs,
-                mask=offs < draft_vocab,
+                mask=in_span & (offs < draft_vocab),
                 other=float("-inf"),
             ).to(tl.float32)
             / d_temp
@@ -311,6 +314,7 @@ def _resample_kernel(
     STRIDE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
+    SPAN: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
 ):
     req = tl.program_id(0).to(tl.int64)
@@ -319,8 +323,9 @@ def _resample_kernel(
     r = tl.load(raw_len_ptr + req).to(tl.int64)
     row = req * STRIDE + r
     is_bonus = r == STRIDE - 1
-    offs = block_idx * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < target_vocab
+    lane = tl.arange(0, BLOCK)
+    offs = block_idx * SPAN + lane
+    mask = (lane < SPAN) & (offs < target_vocab)
     t_temp = tl.load(target_temp_ptr + req).to(tl.float32)
     t = (
         tl.load(
@@ -354,7 +359,7 @@ def _resample_kernel(
     noised = tl.where(mask, residual - tl.log(-_log1p_neg_stable(u)), float("-inf"))
     value, idx = tl.max(noised, axis=0, return_indices=True)
     tl.store(res_max_ptr + req * NUM_BLOCKS + block_idx, value)
-    tl.store(res_arg_ptr + req * NUM_BLOCKS + block_idx, block_idx * BLOCK + idx)
+    tl.store(res_arg_ptr + req * NUM_BLOCKS + block_idx, block_idx * SPAN + idx)
 
 
 @triton.jit
@@ -405,6 +410,22 @@ class BlockwiseRejection:
         return blockwise_rejection_torch(*args, **kwargs)
 
 
+def shard_aligned_spans(vocab: int, shards: int) -> tuple[int, int]:
+    """(stats, resample) block spans of at most _STATS_BLOCK / _RESAMPLE_BLOCK columns
+    that tile each of the ``shards`` equal vocab shards exactly."""
+    if vocab % shards:
+        raise ValueError(f"vocab {vocab} does not split into {shards} shards")
+    shard = vocab // shards
+
+    def span(block: int) -> int:
+        pieces = triton.cdiv(shard, block)
+        if shard % pieces:
+            raise ValueError(f"shard {shard} has no even split under {block}")
+        return shard // pieces
+
+    return span(_STATS_BLOCK), span(_RESAMPLE_BLOCK)
+
+
 def blockwise_rejection_triton(
     *,
     candidates: torch.Tensor,
@@ -414,9 +435,12 @@ def blockwise_rejection_triton(
     draft_temperatures: torch.Tensor,
     noise: RejectionNoise,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    shards: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``draft_logits`` is pre-temperature, or None for a one-hot draft. Returns
-    (correct_len int32, bonus int64, cap_trim_lens int32), each [bs]."""
+    (correct_len int32, bonus int64, cap_trim_lens int32), each [bs]. ``shards`` > 0
+    blocks the vocab so no block straddles a ``vocab / shards`` shard
+    (``shard_aligned_spans``), the blocking the vocab-parallel verify reproduces."""
     bs, stride = candidates.shape
     target_vocab = target_logits.shape[-1]
     assert target_logits.stride(-1) == 1 and target_logits.shape[0] == bs * stride
@@ -427,14 +451,20 @@ def blockwise_rejection_triton(
     device = candidates.device
     target_temperatures = target_temperatures.reshape(-1).contiguous()
     draft_temperatures = draft_temperatures.reshape(-1).contiguous()
-    num_blocks = triton.cdiv(max(target_vocab, draft_vocab), _STATS_BLOCK)
+    stats_span, res_span = (
+        shard_aligned_spans(target_vocab, shards)
+        if shards
+        else (_STATS_BLOCK, _RESAMPLE_BLOCK)
+    )
+    assert not shards or draft_vocab == target_vocab
+    num_blocks = triton.cdiv(max(target_vocab, draft_vocab), stats_span)
     padded_blocks = triton.next_power_of_2(num_blocks)
     stats = torch.empty(
         (4, bs * stride, num_blocks), dtype=torch.float32, device=device
     )
     lens = torch.empty((3, bs), dtype=torch.int32, device=device)
     rej_lse = torch.empty((2, bs), dtype=torch.float32, device=device)
-    res_blocks = triton.cdiv(target_vocab, _RESAMPLE_BLOCK)
+    res_blocks = triton.cdiv(target_vocab, res_span)
     res_max = torch.empty((bs, res_blocks), dtype=torch.float32, device=device)
     res_arg = torch.empty((bs, res_blocks), dtype=torch.int64, device=device)
     bonus = torch.empty((bs,), dtype=torch.int64, device=device)
@@ -449,7 +479,7 @@ def blockwise_rejection_triton(
         d_ptr, d_s0, d_s1,
         target_temperatures, draft_temperatures,
         target_vocab, draft_vocab,
-        STRIDE=stride, NUM_BLOCKS=num_blocks, BLOCK=_STATS_BLOCK,
+        STRIDE=stride, NUM_BLOCKS=num_blocks, BLOCK=_STATS_BLOCK, SPAN=stats_span,
         HAS_DRAFT_LOGITS=has_draft,
     )  # fmt: skip
     has_cutoff = cutoff_verify_lens is not None
@@ -477,7 +507,7 @@ def blockwise_rejection_triton(
         target_temperatures, draft_temperatures,
         target_vocab, draft_vocab, bs,
         noise.key, noise.counter,
-        STRIDE=stride, NUM_BLOCKS=res_blocks, BLOCK=_RESAMPLE_BLOCK,
+        STRIDE=stride, NUM_BLOCKS=res_blocks, BLOCK=_RESAMPLE_BLOCK, SPAN=res_span,
         HAS_DRAFT_LOGITS=has_draft,
     )  # fmt: skip
     _insert_kernel[(bs,)](
@@ -498,8 +528,10 @@ def blockwise_rejection_torch(
     draft_temperatures: torch.Tensor,
     noise: RejectionNoise,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    shards: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference with the same math; draws from a generator seeded by (key, counter)."""
+    """Reference with the same math; draws from a generator seeded by (key, counter).
+    The whole-vocab softmax has no blocks, so ``shards`` does not apply."""
     bs, stride = candidates.shape
     gamma = stride - 1
     vocab = target_logits.shape[-1]

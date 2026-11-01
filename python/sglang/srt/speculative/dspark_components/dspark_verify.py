@@ -814,8 +814,9 @@ class DsparkVerifyEpilogue:
         main = torch.cuda.current_stream()
         if not capturing:
             self._fork_sampled_fold()
-        with torch.cuda.stream(self._sampled_fold_stream), SKIPPABLE.region(
-            _SAMPLED_FOLD
+        with (
+            torch.cuda.stream(self._sampled_fold_stream),
+            SKIPPABLE.region(_SAMPLED_FOLD),
         ):
             committed_engram = self.run_static(
                 io,
@@ -1385,6 +1386,15 @@ def _blockwise_rejection_applies(
     )
 
 
+def _vocab_parallel_shards() -> int:
+    """The TP vocab shards the block-wise rejection blocks on, 0 for its default."""
+    if not envs.SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY.get():
+        return 0
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+    return get_tensor_model_parallel_world_size()
+
+
 def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Tensor:
     if draft_block.greedy_draft:
         # An argmax draft is one-hot: rejection accepts at the target probability.
@@ -1460,6 +1470,7 @@ def accept_draft_tokens(
             draft_temperatures=draft_block.temperatures,
             noise=rejection_noise,
             cutoff_verify_lens=cutoff_verify_lens,
+            shards=_vocab_parallel_shards(),
         )
     else:
         sampled = AcceptSampling.execute(

@@ -2080,6 +2080,9 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark sampled verify on the vocab shards: block-wise rejection blocked so no
+    # block straddles a TP vocab shard (exact in law, new LSE rounding).
+    SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY = EnvBool(False)
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
