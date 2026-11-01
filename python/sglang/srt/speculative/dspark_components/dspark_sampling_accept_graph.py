@@ -214,6 +214,7 @@ def _sampled_accept_tail(
         gated_commit_lens_out=gated_commit_lens,
         block_accept_lens_out=epilogue.read_block_accept_lens(bs),
         relay=epilogue.take_future_relay(io.req_pool_indices, bs),
+        commit=epilogue.take_commit_tail(),
     )
     if envs.SGLANG_DEBUG_DSPARK_SAMPLED_ACCEPT_TAIL_CHECK.get() and not (
         torch.cuda.is_current_stream_capturing()

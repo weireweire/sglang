@@ -29,6 +29,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.sampled_accept_tail import CommitStage
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 
@@ -174,6 +175,24 @@ class DeferredContextCommit:
         self._proj_unjoined = False
         self._proj_rejoinable = True
         return True
+
+    def will_join(self, *, again: bool = False) -> bool:
+        """Whether join_projection(again=again) would join a projection now."""
+        return self._proj_rejoinable if again else self._proj_unjoined
+
+    def stage_targets(
+        self, *, cache_loc: torch.Tensor, positions: torch.Tensor, with_state_slot: bool
+    ) -> CommitStage:
+        """stage()'s operands for a launch that stages the commit itself."""
+        self._with_state_slot = with_state_slot
+        return CommitStage(
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_dst=self.cache_loc,
+            positions_dst=self.positions,
+            commit_lens_dst=self.commit_lens,
+            state_slot_dst=self.state_slot if with_state_slot else None,
+        )
 
     def stage(
         self,

@@ -612,6 +612,9 @@ class Envs:
     # gated commit lengths, future relay scatter) in one launch instead of about seven.
     SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_TAIL = EnvBool(False)
     SGLANG_DEBUG_DSPARK_SAMPLED_ACCEPT_TAIL_CHECK = EnvBool(False)
+    # DSpark static verify: the sampled accept tail also runs the engram history commit
+    # and the deferred-commit staging that follow it. Needs ..._SAMPLED_ACCEPT_TAIL.
+    SGLANG_OPT_DSV41_DSPARK_SAMPLED_COMMIT_TAIL = EnvBool(False)
     # DSpark static verify: the sampling-accept region is captured into the verify graph
     # as a branch beside the greedy fold, switched on for the steps that would replay it.
     # Needs SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.

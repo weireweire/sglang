@@ -36,6 +36,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
     simulated_bonus_sample_graph,
 )
+from sglang.kernels.ops.speculative.dspark.sampled_accept_tail import CommitTail
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -636,6 +637,11 @@ class DsparkVerifyEpilogue:
         self._post_fold = bool(post_fold)
         # Set by run_static's accept when it scattered the future relay itself.
         self._relay_taken = False
+        # SGLANG_OPT_DSV41_DSPARK_SAMPLED_COMMIT_TAIL: run_static offers its commits to
+        # the accept; set while offered, cleared when the sampled tail takes them.
+        self._commit_tail_offer = envs.SGLANG_OPT_DSV41_DSPARK_SAMPLED_COMMIT_TAIL.get()
+        self._commit_tail: Optional[CommitTail] = None
+        self._commit_tail_taken = False
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
         # stage the commit's stores into it; the next draft forward runs them.
@@ -897,7 +903,16 @@ class DsparkVerifyEpilogue:
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
         self._relay_taken = False
+        self._commit_tail = self._commit_tail_plan(
+            io, folds=folds, kv_projected=kv_projected, rejoin=rejoin
+        )
+        self._commit_tail_taken = False
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
+        self._commit_tail = None
+        if self._commit_tail_taken:
+            return self._finish_commit_tail(
+                io, folds=folds, kv_projected=kv_projected, rejoin=rejoin
+            )
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
             io.candidates,
@@ -912,7 +927,7 @@ class DsparkVerifyEpilogue:
             return committed_engram
         cache_loc = io.out_cache_loc
         state_slot = None
-        if self.commit_ctx.kv_injector.swa_ring_size is not None:
+        if self._commits_state_slot():
             state_slot = (
                 io.req_pool_indices.view(-1, 1)
                 .expand(bs, self.stride)
@@ -939,6 +954,47 @@ class DsparkVerifyEpilogue:
             state_slot=state_slot,
         )
         return committed_engram
+
+    def _commits_state_slot(self) -> bool:
+        return self.commit_ctx.kv_injector.swa_ring_size is not None
+
+    def _commit_tail_plan(
+        self, io: StaticVerifyIO, *, folds: bool, kv_projected: bool, rejoin: bool
+    ) -> Optional[CommitTail]:
+        """run_static's commits for the sampled accept tail to run, or None when they
+        stay separate (off, or a commit injected rather than staged)."""
+        if not self._commit_tail_offer:
+            return None
+        stage = None
+        if folds:
+            commit = self.deferred_commit
+            if commit is None or not (kv_projected or commit.will_join(again=rejoin)):
+                return None
+            stage = commit.stage_targets(
+                cache_loc=io.out_cache_loc,
+                positions=io.positions,
+                with_state_slot=self._commits_state_slot(),
+            )
+        return CommitTail(
+            req_slots=io.req_pool_indices, history=self.engram_history(), stage=stage
+        )
+
+    def take_commit_tail(self) -> Optional[CommitTail]:
+        """For the sampled accept tail: run_static's commits, which it then skips."""
+        plan, self._commit_tail = self._commit_tail, None
+        self._commit_tail_taken = plan is not None
+        return plan
+
+    def _finish_commit_tail(
+        self, io: StaticVerifyIO, *, folds: bool, kv_projected: bool, rejoin: bool
+    ) -> bool:
+        """run_static after an accept that ran its commits: the relay scatter it did
+        not take, and the projection join."""
+        if self._post_fold and not self._relay_taken:
+            self._scatter_future_relay(io.req_pool_indices, io.candidates.shape[0])
+        if folds and not kv_projected:
+            assert self.deferred_commit.join_projection(again=rejoin)
+        return self.engram_history() is not None
 
     def _accept_static_greedy(
         self, io: StaticVerifyIO, *, verify_lens, gate, gated: bool
