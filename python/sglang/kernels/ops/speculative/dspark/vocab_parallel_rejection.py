@@ -5,12 +5,13 @@ Each TP rank holds its vocab shard of the target verify logits (pre-softcap, the
 head's output before the gather) and runs ``blockwise_rejection_triton(shards=TP)``'s
 algorithm on it, so the full-vocab logits all-gather is never needed:
 
-1. per shard-aligned stats block (and, under a simulated acceptance, per split of the
-   simulated row's Gumbel-max bonus): the softcap, the block's max / sum-exp, and the
+1. per shard-aligned stats block: the softcap, the block's max / sum-exp, and the
    target logit at every draft token the rank owns, pushed to every rank;
 2. on every rank, the same one-warp accept over the gathered block stats;
 3. the rank's blocks of the rejected row's residual Gumbel-max, pushed to every rank;
-4. on every rank, the same insert over the gathered block maxima.
+4. on every rank, the same insert over the gathered block maxima;
+5. under a simulated acceptance, after the accept as the gathered path draws it, the
+   simulated row's Gumbel-max bonus: per split of the rank's columns, then selected.
 
 Every value, its block and its reduction order are those of the gathered call with
 ``shards=TP``, so the outputs (and the simulated bonus) match it bit for bit.
@@ -111,10 +112,6 @@ def _vp_stats_kernel(
     candidates_stride,
     target_temp_ptr,
     draft_temp_ptr,
-    sim_len_ptr,
-    sim_len_stride,
-    sim_temp_ptr,
-    sim_seed_ptr,
     counter_ptr,
     softcap,
     col0,
@@ -126,12 +123,9 @@ def _vp_stats_kernel(
     LOCAL_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
     SPAN: tl.constexpr,
-    SIM_SPLITS: tl.constexpr,
-    SIM_BLOCK: tl.constexpr,
     ROWS_MAX: tl.constexpr,
     PARITY_WORDS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
-    HAS_SIM: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -141,7 +135,6 @@ def _vp_stats_kernel(
     base = (tl.load(counter_ptr) % 3) * PARITY_WORDS
     stats = base
     tok = base + 4 * ROWS_MAX * NUM_BLOCKS
-    sim = tok + ROWS_MAX
     if step < STRIDE - 1:
         if j < LOCAL_BLOCKS:
             b = RANK * LOCAL_BLOCKS + j
@@ -201,30 +194,6 @@ def _vp_stats_kernel(
                         mc_ptr + 4 * (tok + row),
                         _gathered_value(x_tok, True, softcap, HAS_SOFTCAP),
                     )
-    elif HAS_SIM:
-        if j < SIM_SPLITS:
-            # simulated_bonus_sample_graph's partial over this rank's columns.
-            sim_row = req * STRIDE + tl.load(sim_len_ptr + req * sim_len_stride)
-            t = tl.load(sim_temp_ptr + req).to(tl.float32)
-            local = j * SIM_BLOCK + tl.arange(0, SIM_BLOCK)
-            offs = col0 + local
-            mask = (local < shard_width) & (offs < vocab)
-            x = tl.load(
-                shard_logits_ptr + sim_row.to(tl.int64) * shard_stride + local,
-                mask=mask,
-                other=float("-inf"),
-            )
-            x = _gathered_value(x, mask, softcap, HAS_SOFTCAP)
-            seed = tl.load(sim_seed_ptr)
-            u = tl.rand(seed, req.to(tl.int32) * vocab + offs)
-            noisy = x / tl.maximum(t, 1e-5) - tl.log(-tl.log(u))
-            v = tl.where(mask, tl.where(t > 0.0, noisy, x), float("-inf"))
-            top = tl.max(v, axis=0)
-            idx = tl.min(tl.where(v == top, offs, vocab), axis=0)
-            split = RANK * SIM_SPLITS + j
-            nsplit: tl.constexpr = NUM_BLOCKS // LOCAL_BLOCKS * SIM_SPLITS
-            _push_f32(mc_ptr + 4 * (sim + req * 2 * nsplit + split), top)
-            _push_b32(mc_ptr + 4 * (sim + req * 2 * nsplit + nsplit + split), idx)
 
 
 @triton.jit
@@ -233,7 +202,6 @@ def _vp_rejection_kernel(
     raw_len_ptr,
     trim_ptr,
     rej_lse_ptr,
-    sim_bonus_ptr,
     local_ptr,
     candidates_ptr,
     candidates_stride,
@@ -251,19 +219,16 @@ def _vp_rejection_kernel(
     PADDED_ROWS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     PADDED_BLOCKS: tl.constexpr,
-    NSPLIT: tl.constexpr,
     ROWS_MAX: tl.constexpr,
     PARITY_WORDS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     HAS_CUTOFF: tl.constexpr,
-    HAS_SIM: tl.constexpr,
 ):
     req = tl.program_id(0).to(tl.int64)
     seed = _step_seed(key, counter_ptr)
     base = (tl.load(counter_ptr) % 3) * PARITY_WORDS
     plane: tl.constexpr = ROWS_MAX * NUM_BLOCKS
     tok = base + 4 * plane
-    sim = tok + ROWS_MAX
     # Every word this request reads arrives before any is read or reset.
     cells = tl.arange(0, PADDED_ROWS * NUM_BLOCKS)
     rows_mask = cells < (STRIDE - 1) * NUM_BLOCKS
@@ -274,9 +239,6 @@ def _vp_rejection_kernel(
     steps = tl.arange(0, PADDED_ROWS)
     steps_mask = steps < STRIDE - 1
     _wait_words(local_ptr, tok + row0 + steps, steps_mask)
-    splits = tl.arange(0, 2 * NSPLIT)
-    if HAS_SIM:
-        _wait_words(local_ptr, sim + req * 2 * NSPLIT + splits, splits < 2 * NSPLIT)
     stats_f = local_ptr.to(tl.pointer_type(tl.float32))
     t_max_ptr = stats_f + base
     t_sumexp_ptr = stats_f + base + plane
@@ -339,17 +301,6 @@ def _vp_rejection_kernel(
             )
     tl.store(rej_lse_ptr + req, t_lse_rej)
     tl.store(rej_lse_ptr + bs + req, d_lse_rej)
-    if HAS_SIM:
-        # _simulated_bonus_row_select_kernel over every rank's splits.
-        val = tl.load(stats_f + sim + req * 2 * NSPLIT + tl.arange(0, NSPLIT))
-        idx = tl.load(
-            local_ptr + sim + req * 2 * NSPLIT + NSPLIT + tl.arange(0, NSPLIT)
-        )
-        top = tl.max(val, axis=0)
-        tl.store(
-            sim_bonus_ptr + req,
-            tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64),
-        )
     tl.debug_barrier()
     for p in range(planes):
         tl.store(
@@ -362,11 +313,6 @@ def _vp_rejection_kernel(
         tl.full(steps.shape, _SENTINEL, tl.int32),
         mask=steps_mask,
     )
-    if HAS_SIM:
-        tl.store(
-            local_ptr + sim + req * 2 * NSPLIT + splits,
-            tl.full(splits.shape, _SENTINEL, tl.int32),
-        )
 
 
 @triton.jit
@@ -500,6 +446,82 @@ def _vp_insert_kernel(
         tl.store(counter_ptr, tl.load(counter_ptr) + 1)
 
 
+@triton.jit
+def _vp_sim_partial_kernel(
+    mc_ptr,
+    parity_ptr,
+    shard_logits_ptr,
+    shard_stride,
+    sim_len_ptr,
+    sim_len_stride,
+    sim_temp_ptr,
+    sim_seed_ptr,
+    softcap,
+    col0,
+    shard_width,
+    vocab,
+    RANK: tl.constexpr,
+    STRIDE: tl.constexpr,
+    SIM_SPLITS: tl.constexpr,
+    SIM_BLOCK: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    SIM_OFFSET: tl.constexpr,
+    PARITY_WORDS: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
+):
+    """simulated_bonus_sample_graph's row partial over this rank's columns."""
+    req = tl.program_id(0)
+    j = tl.program_id(1)
+    sim = tl.load(parity_ptr) * PARITY_WORDS + SIM_OFFSET + req * 2 * NSPLIT
+    sim_row = req * STRIDE + tl.load(sim_len_ptr + req * sim_len_stride)
+    t = tl.load(sim_temp_ptr + req).to(tl.float32)
+    local = j * SIM_BLOCK + tl.arange(0, SIM_BLOCK)
+    offs = col0 + local
+    mask = (local < shard_width) & (offs < vocab)
+    x = tl.load(
+        shard_logits_ptr + sim_row.to(tl.int64) * shard_stride + local,
+        mask=mask,
+        other=float("-inf"),
+    )
+    x = _gathered_value(x, mask, softcap, HAS_SOFTCAP)
+    seed = tl.load(sim_seed_ptr)
+    u = tl.rand(seed, req * vocab + offs)
+    noisy = x / tl.maximum(t, 1e-5) - tl.log(-tl.log(u))
+    v = tl.where(mask, tl.where(t > 0.0, noisy, x), float("-inf"))
+    top = tl.max(v, axis=0)
+    idx = tl.min(tl.where(v == top, offs, vocab), axis=0)
+    split = RANK * SIM_SPLITS + j
+    _push_f32(mc_ptr + 4 * (sim + split), top)
+    _push_b32(mc_ptr + 4 * (sim + NSPLIT + split), idx)
+
+
+@triton.jit
+def _vp_sim_select_kernel(
+    out_ptr,
+    local_ptr,
+    parity_ptr,
+    vocab,
+    NSPLIT: tl.constexpr,
+    SIM_OFFSET: tl.constexpr,
+    PARITY_WORDS: tl.constexpr,
+):
+    """_simulated_bonus_row_select_kernel over every rank's partials."""
+    req = tl.program_id(0)
+    sim = tl.load(parity_ptr) * PARITY_WORDS + SIM_OFFSET + req * 2 * NSPLIT
+    words = tl.arange(0, 2 * NSPLIT)
+    _wait_words(local_ptr, sim + words, words < 2 * NSPLIT)
+    val = tl.load(
+        local_ptr.to(tl.pointer_type(tl.float32)) + sim + tl.arange(0, NSPLIT)
+    )
+    idx = tl.load(local_ptr + sim + NSPLIT + tl.arange(0, NSPLIT))
+    top = tl.max(val, axis=0)
+    tl.store(
+        out_ptr + req, tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64)
+    )
+    tl.debug_barrier()
+    tl.store(local_ptr + sim + words, tl.full(words.shape, _SENTINEL, tl.int32))
+
+
 class VocabParallelExchange(msgspec.Struct):
     """The symmetric push buffer of the vocab-parallel rejection and its geometry."""
 
@@ -516,6 +538,7 @@ class VocabParallelExchange(msgspec.Struct):
     sim_splits: int
     rows_max: int
     parity_words: int
+    sim_offset: int
     res_offset: int
     buffer: torch.Tensor
     multicast_ptr: int
@@ -571,6 +594,7 @@ def make_vocab_parallel_exchange(
         sim_splits=sim_splits,
         rows_max=rows_max,
         parity_words=parity_words,
+        sim_offset=4 * rows_max * num_blocks + rows_max,
         res_offset=res_offset,
         buffer=buffer,
         multicast_ptr=handle.multicast_ptr,
@@ -632,23 +656,18 @@ def vocab_parallel_rejection(
     has_sim = sim is not None
     has_softcap = softcap is not None
     softcap = softcap if has_softcap else 1.0
-    sim_len = sim.correct_len if has_sim else lens[0]
-    sim_temp = sim.temperatures if has_sim else target_temperatures
-    sim_seed = sim.seed if has_sim else lens[0]
-    _vp_stats_kernel[(bs * stride, max(ex.local_blocks, ex.sim_splits))](
+    _vp_stats_kernel[(bs * stride, ex.local_blocks)](
         ex.multicast_ptr,
         shard_logits, shard_logits.stride(0),
         d_ptr, d_s0, d_s1,
         candidates, candidates.stride(0),
         target_temperatures, draft_temperatures,
-        sim_len, sim_len.stride(0), sim_temp, sim_seed,
         noise.counter,
         softcap, col0, ex.shard_width, ex.vocab,
         RANK=ex.rank, STRIDE=stride, NUM_BLOCKS=num_blocks,
         LOCAL_BLOCKS=ex.local_blocks, BLOCK=_STATS_BLOCK, SPAN=ex.stats_span,
-        SIM_SPLITS=ex.sim_splits, SIM_BLOCK=_SIM_BLOCK,
         ROWS_MAX=ex.rows_max, PARITY_WORDS=ex.parity_words,
-        HAS_DRAFT_LOGITS=has_draft, HAS_SIM=has_sim, HAS_SOFTCAP=has_softcap,
+        HAS_DRAFT_LOGITS=has_draft, HAS_SOFTCAP=has_softcap,
     )  # fmt: skip
     has_cutoff = cutoff_verify_lens is not None
     verify_lens = (
@@ -656,7 +675,6 @@ def vocab_parallel_rejection(
     )
     _vp_rejection_kernel[(bs,)](
         correct_len, raw_len, trim, rej_lse,
-        sim_bonus if has_sim else bonus,
         ex.buffer,
         candidates, candidates.stride(0), verify_lens,
         d_ptr, d_s0, d_s1,
@@ -665,8 +683,8 @@ def vocab_parallel_rejection(
         noise.key, noise.counter,
         STRIDE=stride, PADDED_ROWS=triton.next_power_of_2(stride - 1),
         NUM_BLOCKS=num_blocks, PADDED_BLOCKS=triton.next_power_of_2(num_blocks),
-        NSPLIT=nsplit, ROWS_MAX=ex.rows_max, PARITY_WORDS=ex.parity_words,
-        HAS_DRAFT_LOGITS=has_draft, HAS_CUTOFF=has_cutoff, HAS_SIM=has_sim,
+        ROWS_MAX=ex.rows_max, PARITY_WORDS=ex.parity_words,
+        HAS_DRAFT_LOGITS=has_draft, HAS_CUTOFF=has_cutoff,
         num_warps=1,
     )  # fmt: skip
     _vp_resample_kernel[(bs, ex.res_local_blocks)](
@@ -691,4 +709,20 @@ def vocab_parallel_rejection(
         NUM_BLOCKS=res_blocks, PADDED_BLOCKS=triton.next_power_of_2(res_blocks),
         num_warps=1,
     )  # fmt: skip
+    if has_sim:
+        # After the accept, where the gathered path draws it: the simulation's own cost.
+        _vp_sim_partial_kernel[(bs, ex.sim_splits)](
+            ex.multicast_ptr, ex.parity,
+            shard_logits, shard_logits.stride(0),
+            sim.correct_len, sim.correct_len.stride(0), sim.temperatures, sim.seed,
+            softcap, col0, ex.shard_width, ex.vocab,
+            RANK=ex.rank, STRIDE=stride, SIM_SPLITS=ex.sim_splits, SIM_BLOCK=_SIM_BLOCK,
+            NSPLIT=nsplit, SIM_OFFSET=ex.sim_offset, PARITY_WORDS=ex.parity_words,
+            HAS_SOFTCAP=has_softcap,
+            num_warps=8,
+        )  # fmt: skip
+        _vp_sim_select_kernel[(bs,)](
+            sim_bonus, ex.buffer, ex.parity, ex.vocab,
+            NSPLIT=nsplit, SIM_OFFSET=ex.sim_offset, PARITY_WORDS=ex.parity_words,
+        )  # fmt: skip
     return correct_len, bonus, trim, sim_bonus
