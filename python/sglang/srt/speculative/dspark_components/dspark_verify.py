@@ -65,6 +65,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
+from sglang.srt.speculative.dspark_components.dspark_vocab_parallel import (
+    VocabParallelVerify,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -316,7 +319,10 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        keep_vocab_shard: bool = False,
     ) -> TargetVerifyResult:
+        """``keep_vocab_shard``: the replay's sampled branch accepts and nothing on the
+        host reads the verify row, so vocab-parallel logits stay sharded."""
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
         verify_cache_loc = verify_window.verify_cache_loc
@@ -352,6 +358,15 @@ class TargetVerifyExecutor:
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
+        if self.verify_epilogue is not None:
+            logits_output = result.logits_output
+            logits_output.next_token_logits = (
+                self.verify_epilogue.resolve_verify_logits(
+                    logits_output.next_token_logits,
+                    keep_shard=keep_vocab_shard,
+                    graph_replayed=result.can_run_cuda_graph,
+                )
+            )
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
@@ -609,8 +624,13 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_commit: Optional[DeferredContextCommit] = None,
         post_fold: bool = False,
+        vocab_parallel: Optional[VocabParallelVerify] = None,
     ) -> None:
         self.max_bs = int(max_bs)
+        # The verify graphs return vocab shards; the greedy branch gathers them into
+        # greedy_full_logits (per captured batch size), the sampled one rejects on them.
+        self.vocab_parallel = vocab_parallel
+        self.greedy_full_logits: dict[int, torch.Tensor] = {}
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
@@ -711,8 +731,13 @@ class DsparkVerifyEpilogue:
         if not runner.ragged_verify_mode:
             self._static_epilogue(out, forward_batch)
             return
+        compact_logits = out.next_token_logits
+        if self.vocab_parallel is not None and self.vocab_parallel.is_shard(
+            compact_logits
+        ):
+            compact_logits = self.vocab_parallel.gather(compact_logits)
         self(
-            compact_logits=out.next_token_logits,
+            compact_logits=compact_logits,
             compact_hidden=out.hidden_states,
             input_ids=forward_batch.input_ids,
             seq_lens=forward_batch.seq_lens,
@@ -795,13 +820,38 @@ class DsparkVerifyEpilogue:
             # Fork before the greedy branch, so the sampled one waits only on the logits.
             self._fork_sampled_fold()
         with region:
+            greedy_io = io
+            vp = self.vocab_parallel
+            if vp is not None and vp.is_shard(io.logits):
+                greedy_io = msgspec.structs.replace(io, logits=vp.gather(io.logits))
+                if capturing:
+                    self.greedy_full_logits[bs] = greedy_io.logits
             committed_engram = self.run_static(
-                io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+                greedy_io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
             )
         if committed_engram and capturing:
             self.folds_engram_commit = True
         if fold:
             self._sampled_fold_branch(io, capturing=capturing)
+
+    def resolve_verify_logits(
+        self, logits: torch.Tensor, *, keep_shard: bool, graph_replayed: bool
+    ) -> torch.Tensor:
+        """The target-verify logits the host continues with: the vocab shard when
+        the replay's sampled branch accepted and nothing else reads the row, else
+        the whole row (the armed greedy branch's gather, or a gather here)."""
+        vp = self.vocab_parallel
+        if vp is None or not vp.is_shard(logits):
+            return logits
+        if graph_replayed and keep_shard:
+            return logits
+        if graph_replayed and SKIPPABLE.enabled.get(SKIPPABLE.DEFAULT, True):
+            rows = logits.shape[0]
+            graph_bs = min(
+                b for b in self.greedy_full_logits if b * self.stride >= rows
+            )
+            return self.greedy_full_logits[graph_bs][:rows]
+        return vp.gather(logits)
 
     def _fork_sampled_fold(self) -> None:
         if self._sampled_fold_stream is None:

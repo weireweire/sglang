@@ -41,6 +41,9 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionN
 from sglang.kernels.ops.speculative.dspark.sampled_accept_tail import (
     sampled_accept_tail,
 )
+from sglang.kernels.ops.speculative.dspark.vocab_parallel_rejection import (
+    SimulatedBonusArgs,
+)
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
@@ -93,22 +96,38 @@ def sampling_accept_commit_lens(
         temperatures=params.temperatures[:bs],
         greedy_draft=draft_sampler.greedy_draft,
     )
-    correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-        candidates=io.candidates,
-        target_logits=io.logits,
-        draft_block=draft_block,
-        # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
-        sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
-        draft_input=None,
-        gamma=stride - 1,
-        verify_num_draft_tokens=stride,
-        block_verification=block_verification,
-        rejection_noise=rejection_noise,
-    )
-    bonus_logits = io.logits
-    if epilogue.simulated_correct_len is not None:
-        bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
+    vocab_parallel = epilogue.vocab_parallel
+    if vocab_parallel is not None and vocab_parallel.is_shard(io.logits):
+        assert rejection_noise is not None and not block_verification
+        correct_len, bonus, cap_trim_lens, sim_bonus = vocab_parallel.reject(
+            candidates=io.candidates,
+            shard=io.logits,
+            draft_logits=draft_block.corrected_logits,
+            target_temperatures=params.temperatures[:bs],
+            draft_temperatures=draft_block.temperatures,
+            noise=rejection_noise,
+            sim=_simulated_bonus_args(epilogue, bs),
+        )
+        if sim_bonus is not None:
+            bonus = sim_bonus
         bonus_logits = None
+    else:
+        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+            candidates=io.candidates,
+            target_logits=io.logits,
+            draft_block=draft_block,
+            # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
+            sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
+            draft_input=None,
+            gamma=stride - 1,
+            verify_num_draft_tokens=stride,
+            block_verification=block_verification,
+            rejection_noise=rejection_noise,
+        )
+        bonus_logits = io.logits
+        if epilogue.simulated_correct_len is not None:
+            bonus = epilogue.sim_bonus(io.logits, bs).to(bonus.dtype).view_as(bonus)
+            bonus_logits = None
     if envs.SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_TAIL.get():
         return _sampled_accept_tail(
             io,
@@ -139,6 +158,19 @@ def sampling_accept_commit_lens(
     if not gated:
         return None
     return torch.minimum(commit_lens, verify_lens.to(torch.int32)) * gate
+
+
+def _simulated_bonus_args(
+    epilogue: DsparkVerifyEpilogue, bs: int
+) -> Optional[SimulatedBonusArgs]:
+    """DsparkVerifyEpilogue.sim_bonus's staged inputs, or None without a simulation."""
+    if epilogue.simulated_correct_len is None:
+        return None
+    return SimulatedBonusArgs(
+        correct_len=epilogue.simulated_correct_len.expand(bs),
+        temperatures=epilogue.sim_temperatures_buf[:bs],
+        seed=epilogue.sim_seed_buf,
+    )
 
 
 def _sampled_accept_tail(

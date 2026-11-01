@@ -584,6 +584,10 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        # SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY: set before graph capture by a
+        # speculative worker that accepts on the vocab shards; without a softcap the
+        # target-verify logits come back as the LM head's shard too.
+        self.vocab_parallel_verify = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1236,13 +1240,17 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, lm_head, logits_metadata
         ):
             if (
-                self.defer_verify_gather
-                and logits_metadata.forward_mode.is_target_verify()
-            ):
+                self.defer_verify_gather or self.vocab_parallel_verify
+            ) and logits_metadata.forward_mode.is_target_verify():
                 return logits
             return self._gather_softcap_fused(
                 logits, logits_metadata, use_logits_buffer
             )
+
+        if self._defers_unfused_verify_gather(
+            logits, local_hidden_states, lm_head, logits_metadata
+        ):
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -1317,11 +1325,40 @@ class LogitsProcessor(nn.Module):
             )
         )
 
+    def _defers_unfused_verify_gather(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        return (
+            self.vocab_parallel_verify
+            and logits_metadata.forward_mode.is_target_verify()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.final_logit_softcapping
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
     def is_deferred_shard(self, logits: torch.Tensor) -> bool:
-        return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
+        return (
+            self.defer_verify_gather or self.vocab_parallel_verify
+        ) and logits.shape[-1] < self.vocab_size
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
         """Full softcapped logits from a target-verify vocab shard."""
+        if not self.final_logit_softcapping:
+            # The unfused path's gather and fp32 cast, without its graph buffer.
+            gathered = self._logits_gatherer(logits)
+            if gathered.shape[-1] > self.vocab_size:
+                gathered = gathered[:, : self.vocab_size]
+            return gathered.float()
         return self._gather_softcap_fused(logits, None, use_buffer=False)
 
     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:

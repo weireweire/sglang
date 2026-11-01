@@ -10,6 +10,7 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -86,6 +87,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     target_model_type,
     verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.dspark_components.dspark_vocab_parallel import (
+    VocabParallelVerify,
+    vocab_parallel_verify_supported,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
@@ -442,6 +447,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                vocab_parallel=self._maybe_vocab_parallel_verify(
+                    static_epilogue_supported
+                ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -705,6 +713,44 @@ class DSparkWorkerV2(BaseSpecWorker):
         logger.info(
             "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft context-KV commit runs at the "
             "head of the next draft graph, joined at its first KV store."
+        )
+
+    def _maybe_vocab_parallel_verify(
+        self, static_epilogue_supported: bool
+    ) -> Optional[VocabParallelVerify]:
+        """SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY, where the sampled accept folds
+        into the static verify graph with block-wise rejection and replicated drafts."""
+        if not envs.SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY.get():
+            return None
+        processors = [
+            module
+            for module in self.target_worker.model_runner.model.modules()
+            if isinstance(module, LogitsProcessor)
+        ]
+        eligible = (
+            static_epilogue_supported
+            and self._rejection_noise is not None
+            and not self._sharded_accept
+            and not get_spec().speculative_use_block_verification
+            and envs.SGLANG_OPT_DSV41_DSPARK_SAMPLED_ACCEPT_FOLD.get()
+            and envs.SGLANG_OPT_DSV41_SKIP_DISARMED_EPILOGUE.get()
+            and len(processors) == 1
+            and vocab_parallel_verify_supported(
+                tp_size=get_parallel().tp_size, vocab_size=processors[0].vocab_size
+            )
+        )
+        if not eligible:
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "SGLANG_OPT_DSV41_DSPARK_VOCAB_PARALLEL_VERIFY ignored: it needs the "
+                    "static verify graph's sampled-accept fold with block-wise "
+                    "rejection, replicated draft logits and TP > 1."
+                )
+            return None
+        return VocabParallelVerify(
+            logits_processor=processors[0],
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
         )
 
     def _maybe_attach_sampled_fold(self) -> None:
@@ -1267,6 +1313,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    keep_vocab_shard=sampled_fold
+                    and not batch.return_logprob
+                    and (
+                        sampling_info is None
+                        or sampling_info.sampling_mask_batch_indices is None
+                    ),
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1301,8 +1353,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         region_engram = False
         if sampled_fold and can_run_cuda_graph:
             graph_bs = min(b for b in epilogue.static_io if b >= bs)
+            # A vocab-parallel step may have gathered the replay's shard since.
             assert (
-                target_logits.data_ptr() == epilogue.static_io[graph_bs].logits.data_ptr()
+                epilogue.vocab_parallel is not None
+                or target_logits.data_ptr()
+                == epilogue.static_io[graph_bs].logits.data_ptr()
             ), "the folded sampling accept read another replay's logits"
             region_accept = epilogue.read_accept(bs)
             region_engram = epilogue.sampled_fold_engram
