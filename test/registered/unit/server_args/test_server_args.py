@@ -4598,10 +4598,16 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_native_grpc_rejects_multi_tokenizer(self):
-        sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
-        with self.assertRaises(ValueError):
-            handle_grpc_args(sa)
+    def test_native_grpc_multi_tokenizer_port_block(self):
+        handle_grpc_args(self._args(grpc_port=40000, tokenizer_worker_num=2))
+        with self.assertRaisesRegex(ValueError, "65535"):
+            handle_grpc_args(self._args(grpc_port=65535, tokenizer_worker_num=2))
+        with self.assertRaisesRegex(ValueError, "--sidecar"):
+            handle_grpc_args(
+                self._args(
+                    grpc_port=40000, tokenizer_worker_num=2, sidecar="example.sidecar"
+                )
+            )
 
     def test_native_grpc_rejects_http_auth(self):
         sa = self._args(grpc_port=40000, api_key="secret")
@@ -4681,7 +4687,7 @@ class TestGrpcServerArgs(CustomTestCase):
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
-                grpc_port=get_serving().grpc_port,
+                grpc_ports=[get_serving().grpc_port],
             )
 
         self.assertEqual(handle, "handle")
@@ -4700,6 +4706,40 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(kwargs["worker_threads"], 4)
         self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
+
+    def test_tokenizer_worker_takes_first_free_grpc_port(self):
+        from sglang.srt.entrypoints import http_server
+
+        bind_error = RuntimeError("Failed to bind gRPC server to 127.0.0.1:50051")
+        fake_core = SimpleNamespace(
+            start_server=MagicMock(side_effect=[bind_error, "handle"])
+        )
+        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
+        override = get_context().override_server_args(
+            host="127.0.0.1", grpc_port=50051, tokenizer_worker_num=2
+        )
+        server_args = override.install()
+        self.addCleanup(override.restore)
+        with (
+            patch(
+                "sglang.srt.rust_extensions.load_rust_extension",
+                return_value=fake_core,
+            ),
+            patch.dict(
+                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
+            ),
+        ):
+            handle = http_server._start_native_grpc_server_for_runtime(
+                server_args=server_args,
+                tokenizer_manager=MagicMock(),
+                template_manager=MagicMock(),
+                scheduler_info={},
+                grpc_ports=http_server._native_grpc_ports(),
+            )
+
+        self.assertEqual(handle, "handle")
+        ports = [c.kwargs["port"] for c in fake_core.start_server.call_args_list]
+        self.assertEqual(ports, [50051, 50052])
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):

@@ -81,7 +81,9 @@ class Serving(msgspec.Struct):
         Optional[int],
         "Port for the native gRPC server, started alongside HTTP. Setting this "
         "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. Follower nodes expose GetServerInfo only.",
+        "default. Follower nodes expose GetServerInfo only. With "
+        "--tokenizer-worker-num N, each tokenizer worker serves gRPC on its own "
+        "port in [grpc_port, grpc_port + N).",
     ] = None
     grpc_response_timeout_secs: A[
         int,
