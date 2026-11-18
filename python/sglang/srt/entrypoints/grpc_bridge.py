@@ -9,6 +9,7 @@ TokenizerManager's event loop.
 import asyncio
 import json
 import logging
+import os
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -455,6 +456,9 @@ class RuntimeHandle:
                     "grpc_features": _media_input_features(
                         self.tokenizer_manager.mm_processor
                     ),
+                    # Tokenizer workers share --grpc-port, so a client tells
+                    # which worker serves a connection by this id.
+                    "tokenizer_worker_id": os.getpid(),
                 }
             ),
             default=str,

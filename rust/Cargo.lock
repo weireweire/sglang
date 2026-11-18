@@ -3999,6 +3999,7 @@ dependencies = [
  "pyo3",
  "serde_json",
  "sglang-runtime-v1-types",
+ "socket2",
  "tokenizers 0.21.4",
  "tokio",
  "tokio-stream",

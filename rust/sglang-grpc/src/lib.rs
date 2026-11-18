@@ -36,11 +36,16 @@ impl GrpcServerHandle {
     }
 }
 
-fn bind_listener(host: &str, port: u16) -> PyResult<TcpListener> {
+fn bind_listener(host: &str, port: u16, reuse_port: bool) -> PyResult<TcpListener> {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid address: {}", e)))?;
-    let listener = TcpListener::bind(addr).map_err(|e| {
+    let bound = if reuse_port {
+        bind_reuse_port(addr)
+    } else {
+        TcpListener::bind(addr)
+    };
+    let listener = bound.map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Failed to bind gRPC server to {}: {}",
             addr, e
@@ -53,6 +58,22 @@ fn bind_listener(host: &str, port: u16) -> PyResult<TcpListener> {
         ))
     })?;
     Ok(listener)
+}
+
+/// Every tokenizer worker binds the same port; the kernel spreads new
+/// connections over the listeners.
+fn bind_reuse_port(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    // std's TcpListener::bind backlog.
+    socket.listen(128)?;
+    Ok(socket.into())
 }
 
 fn start_server_thread(
@@ -87,7 +108,7 @@ fn start_metadata_server(
     port: u16,
     server_info_json: String,
 ) -> PyResult<GrpcServerHandle> {
-    let listener = bind_listener(&host, port)?;
+    let listener = bind_listener(&host, port, false)?;
     // Metadata is a startup snapshot; it needs neither Python callbacks nor a
     // worker pool. The dedicated server thread drives this runtime directly.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -210,11 +231,12 @@ fn extract_tokenizer_info(runtime_handle: &Py<PyAny>) -> PyResult<TokenizerInfo>
 ///     host: Bind address (e.g., "0.0.0.0")
 ///     port: Port number (e.g., 40000)
 ///     runtime_handle: Python RuntimeHandle object with submit_generate, submit_embed, abort, etc.
+///     reuse_port: Bind with SO_REUSEPORT so several tokenizer worker processes share the port.
 ///
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300, reuse_port=false))]
 fn start_server(
     host: String,
     port: u16,
@@ -222,6 +244,7 @@ fn start_server(
     worker_threads: usize,
     response_channel_capacity: usize,
     response_timeout_secs: u64,
+    reuse_port: bool,
 ) -> PyResult<GrpcServerHandle> {
     // Best-effort: embedding processes may initialize tracing themselves.
     let _ = tracing_subscriber::fmt()
@@ -250,7 +273,7 @@ fn start_server(
         response_timeout_secs
     };
     let response_timeout = Duration::from_secs(response_timeout_secs);
-    let listener = bind_listener(&host, port)?;
+    let listener = bind_listener(&host, port, reuse_port)?;
 
     let tokenizer_info = extract_tokenizer_info(&runtime_handle)?;
 

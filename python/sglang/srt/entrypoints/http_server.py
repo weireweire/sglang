@@ -441,7 +441,7 @@ async def lifespan(fast_api_app: FastAPI):
                 tokenizer_manager=_global_state.tokenizer_manager,
                 template_manager=_global_state.template_manager,
                 scheduler_info=_global_state.scheduler_info,
-                grpc_ports=_native_grpc_ports(),
+                grpc_port=get_serving().grpc_port,
             )
             if get_serving().sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
@@ -3185,22 +3185,12 @@ def _setup_and_run_http_server(
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
 
-def _native_grpc_ports() -> List[int]:
-    """Candidate ports of this process's native gRPC server.
-
-    Tokenizer workers do not know their index, so each takes the first free
-    port of the [grpc_port, grpc_port + tokenizer_worker_num) block.
-    """
-    serving = get_serving()
-    return [serving.grpc_port + i for i in range(serving.tokenizer_worker_num)]
-
-
 def _start_native_grpc_server_for_runtime(
     server_args,
     tokenizer_manager,
     template_manager,
     scheduler_info,
-    grpc_ports: List[int],
+    grpc_port,
 ):
     from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
     from sglang.srt.rust_extensions import load_rust_extension
@@ -3214,22 +3204,17 @@ def _start_native_grpc_server_for_runtime(
         scheduler_info=scheduler_info or {},
     )
 
-    for i, grpc_port in enumerate(grpc_ports):
-        try:
-            grpc_handle = grpc_native.start_server(
-                host=get_serving().host,
-                port=grpc_port,
-                runtime_handle=runtime_handle,
-                worker_threads=get_serving().grpc_worker_threads,
-                response_timeout_secs=get_serving().grpc_response_timeout_secs,
-            )
-        except RuntimeError as e:
-            # A sibling tokenizer worker holds this port; try the next one.
-            if "Failed to bind" not in str(e) or i == len(grpc_ports) - 1:
-                raise
-            continue
-        logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
-        return grpc_handle
+    grpc_handle = grpc_native.start_server(
+        host=get_serving().host,
+        port=grpc_port,
+        runtime_handle=runtime_handle,
+        worker_threads=get_serving().grpc_worker_threads,
+        response_timeout_secs=get_serving().grpc_response_timeout_secs,
+        # Tokenizer workers share the port; the kernel spreads connections.
+        reuse_port=get_serving().tokenizer_worker_num > 1,
+    )
+    logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
+    return grpc_handle
 
 
 def _shutdown_native_grpc_server(grpc_handle) -> None:

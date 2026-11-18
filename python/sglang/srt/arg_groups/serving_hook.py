@@ -325,16 +325,10 @@ def handle_grpc_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        if cfg.grpc_port + cfg.tokenizer_worker_num - 1 > 65535:
-            raise ValueError(
-                f"--grpc-port ({cfg.grpc_port}) plus --tokenizer-worker-num "
-                f"({cfg.tokenizer_worker_num}) - 1 must not exceed 65535: "
-                "each tokenizer worker serves gRPC on its own port."
-            )
         if cfg.sidecar is not None and cfg.tokenizer_worker_num > 1:
             raise ValueError(
                 "--sidecar does not support --tokenizer-worker-num > 1; launch the "
-                "sidecar separately against the per-worker gRPC ports."
+                "sidecar separately against --grpc-port."
             )
         if cfg.api_key or cfg.admin_api_key:
             raise ValueError(

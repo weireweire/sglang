@@ -27,6 +27,8 @@ pyo3 = { workspace = true }
 sglang-runtime-v1-types = { path = "../sglang-runtime-v1-types" }
 # preserve_order: JSON objects reach Python as dicts in insertion order.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# "all": SO_REUSEPORT for the per-tokenizer-worker listeners.
+socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
